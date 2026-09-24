@@ -740,6 +740,12 @@ async function onMessage(msg) {
   const userId = String(msg.from.id);
   const chatId = msg.chat.id;
 
+  if (!isOwner(userId)) {
+    const now = Date.now();
+    if (now - (lastMsg[userId] || 0) < 1200) return;
+    lastMsg[userId] = now;
+  }
+
   if (isOwner(userId)) {
     const u = touchUser(msg);
     const q = String(msg.text).trim();
@@ -862,6 +868,7 @@ async function onMessage(msg) {
 }
 
 let pendingProtect = {};
+let lastMsg = {};
 
 // ============================ لوحة تحكم (Callback) ============================
 
