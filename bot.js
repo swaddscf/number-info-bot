@@ -1,945 +1,1365 @@
 require('dotenv').config();
-
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const TelegramBot = require('node-telegram-bot-api');
 const phonenumbers = require('google-libphonenumber');
 const tzLookup = require('tz-lookup');
 
-const util = phonenumbers.PhoneNumberUtil.getInstance();
+const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) { console.error('❌ BOT_TOKEN مفقود من .env'); process.exit(1); }
+
+const PORT = parseInt(process.env.PORT || '8080', 10);
+const OWNER_ID = String(process.env.OWNER_ID || '').trim();
+const API_ID = parseInt(process.env.TELEGRAM_API_ID || '0', 10);
+const API_HASH = String(process.env.TELEGRAM_API_HASH || '');
+const TG_SESSION = String(process.env.TG_SESSION || '');
+const DATA_DIR = String(process.env.DATA_DIR || path.join(__dirname, 'data'));
+
+const PHONE = phonenumbers.PhoneNumberUtil.getInstance();
+const CARRIERS = require('./carriers.json');
 const COUNTRIES_AR = require('./countries.json');
 
-const BOT_TOKEN = process.env.BOT_TOKEN || '';
-const API_ID = Number(process.env.TELEGRAM_API_ID || 0);
-const API_HASH = process.env.TELEGRAM_API_HASH || '';
-const TG_SESSION = process.env.TG_SESSION || '';
-const OWNER_ID = process.env.OWNER_ID ? String(process.env.OWNER_ID) : '';
-const PORT = Number(process.env.PORT || 8080);
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+// ============================ التخزين ============================
 
-let bot = null;
+function ensureDirs() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+ensureDirs();
 
-// ===================== التخزين =====================
-fs.mkdirSync(DATA_DIR, { recursive: true });
-const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const FILES = {
+  config: path.join(DATA_DIR, 'config.json'),
+  users: path.join(DATA_DIR, 'users.json'),
+  protected: path.join(DATA_DIR, 'protected.json'),
+};
 
-function readJSON(file, def) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return def; }
+function readJSON(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return fallback; }
+}
+function writeJSON(file, data) {
+  try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); return true; } catch (e) { return false; }
 }
 
 const DEFAULT_CONFIG = {
-  locationEnabled: true,  // عرض الموقع / الخريطة
-  usernameEnabled: true,  // عرض يوزر تيليجرام
-  regionEnabled: true,    // عرض المنطقة / المدينة
-  dailyLimit: 0,          // 0 = غير محدود (لكل مستخدم في اليوم)
-  perSearchStars: 0,      // 0 = ميزة الدفع معطلة
-  contact: '',            // نص زر "تواصل مع المالك" (فارغ = الزر مخفي)
+  locationEnabled: true,
+  usernameEnabled: true,
+  regionEnabled: true,
+  dailyLimit: 3,
+  quotaHours: 24,
+  perSearchStars: 0,
+  protectPrice: 0,
+  topupStars: 0,
+  topupAmount: 2,
+  contact: '',
+  notifyReveals: true,
+  notifyJoins: true,
+  maintenance: false,
+  cleanupDays: 60,
 };
 
-let config = { ...DEFAULT_CONFIG, ...readJSON(CONFIG_FILE, {}) };
-let users = readJSON(USERS_FILE, {});
+const config = Object.assign({}, DEFAULT_CONFIG, readJSON(FILES.config, {}));
+const users = readJSON(FILES.users, {});
+const protectedNumbers = readJSON(FILES.protected, {});
 
-function saveConfig() { fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2)); }
-function saveUsers() { fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2)); }
+function saveConfig() { writeJSON(FILES.config, config); }
+function saveUsers() { writeJSON(FILES.users, users); }
+function saveProtected() { writeJSON(FILES.protected, protectedNumbers); }
 
-function todayKey() { return new Date().toISOString().slice(0, 10); }
+// ============================ أدوات عامة ============================
 
-function getUser(id) {
-  const k = String(id);
-  if (!users[k]) users[k] = { date: todayKey(), used: 0, limit: null, paid: 0, total: 0, premium: false };
-  return users[k];
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-function resetIfNewDay(u) {
-  if (u.date !== todayKey()) { u.date = todayKey(); u.used = 0; }
-}
-
-function dailyLimitFor(u) {
-  return u.limit != null ? u.limit : config.dailyLimit;
-}
-
-function isPremiumUser(u) {
-  return !!(u && u.premium);
-}
-
-function freeSearchAllowed(u) {
-  resetIfNewDay(u);
-  if (isPremiumUser(u)) return true; // المميز يبحث بلا حدود
-  const lim = dailyLimitFor(u);
-  return lim === 0 || u.used < lim;
-}
-
-function premiumUsers() {
-  return Object.keys(users).filter((k) => users[k].premium);
+function esc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function isOwner(id) {
   return OWNER_ID && String(id) === OWNER_ID;
 }
 
-// ===================== أدوات =====================
-let CARRIERS = {};
-try { CARRIERS = require('./carriers.json') || {}; } catch (e) { CARRIERS = {}; }
+function getUser(id) {
+  const key = String(id);
+  if (!users[key]) {
+    users[key] = { id: key, name: '', username: '', joinedAt: Date.now(), lastSeen: Date.now(), date: todayKey(), total: 0, used: 0, topup: 0, paid: 0, premium: false, banned: false, quotaUntil: 0 };
+  } else {
+    users[key].id = key;
+  }
+  return users[key];
+}
 
-const PN_TYPES = {
-  0: '☎️ خط أرضي',
-  1: '📱 جوال',
-  2: '📞 أرضي أو جوال',
-  3: '🎁 رقم مجاني',
-  4: '💎 رقم مميز (مدفوع)',
-  5: '🔁 تكلفة مشتركة',
-  6: '💬 VoIP',
-  7: '👤 رقم شخصي',
-  8: '📟 بيجر',
-  9: '🌐 UAN',
-  10: '📤 بريد صوتي',
-  '-1': '❓ غير معروف',
-};
+function touchUser(msg) {
+  const from = msg.from || {};
+  const key = String(from.id);
+  const u = getUser(key);
+  u.lastSeen = Date.now();
+  u.date = todayKey();
+  if (from.first_name || from.last_name) u.name = [from.first_name, from.last_name].filter(Boolean).join(' ').slice(0, 60);
+  if (from.username) u.username = from.username;
+  return u;
+}
 
-const CENTROIDS = {
-  AF: [33.94, 67.71], AL: [41.15, 20.17], DZ: [28.03, 1.66],
-  AD: [42.55, 1.60], AO: [-12.30, 17.60], AR: [-38.42, -63.62],
-  AM: [40.07, 45.04], AU: [-25.27, 133.78], AT: [47.52, 14.55],
-  AZ: [40.14, 47.58], BH: [26.07, 50.55], BD: [23.68, 90.36],
-  BY: [53.71, 27.95], BE: [50.50, 4.47], BJ: [9.30, 2.30],
-  BO: [-16.29, -63.59], BA: [44.31, 17.68], BW: [-24.60, 24.68],
-  BR: [-14.24, -51.93], BG: [42.73, 25.49], BF: [12.24, -1.56],
-  BI: [-3.37, 29.92], KH: [12.57, 104.99], CM: [7.37, 12.35],
-  CA: [56.13, -106.35], CF: [6.61, 20.94], TD: [15.45, 18.73],
-  CL: [-35.68, -71.54], CN: [35.86, 104.20], CO: [4.57, -74.30],
-  CD: [-4.04, 21.76], CG: [-0.23, 15.83], CR: [9.75, -83.75],
-  HR: [45.10, 15.20], CU: [21.52, -77.78], CY: [35.13, 33.43],
-  CZ: [49.82, 15.47], DK: [56.26, 9.50], DO: [18.74, -70.16],
-  EC: [-1.83, -78.18], EG: [26.82, 30.80], SV: [13.79, -88.90],
-  ER: [15.18, 39.78], EE: [58.60, 25.01], SZ: [-26.52, 31.47],
-  ET: [9.15, 40.49], FJ: [-17.71, 178.07], FI: [61.92, 25.75],
-  FR: [46.23, 2.21], GA: [-0.80, 11.61], GM: [13.44, -15.31],
-  GE: [42.32, 43.36], DE: [51.17, 10.45], GH: [7.95, -1.02],
-  GR: [39.07, 21.82], GT: [15.78, -90.23], GN: [9.95, -9.70],
-  HT: [18.97, -72.28], HN: [15.20, -86.24], HU: [47.16, 19.50],
-  IS: [64.96, -19.02], IN: [20.59, 78.96], ID: [-0.79, 113.92],
-  IR: [32.43, 53.69], IQ: [33.22, 43.68], IE: [53.41, -8.24],
-  IL: [31.05, 34.85], IT: [41.87, 12.57], CI: [7.54, -5.55],
-  JM: [18.11, -77.30], JP: [36.20, 138.25], JO: [31.24, 36.57],
-  KZ: [48.02, 66.92], KE: [-0.02, 37.91], KW: [29.31, 47.48],
-  KG: [41.20, 74.77], LA: [19.86, 102.50], LV: [56.88, 24.60],
-  LB: [33.85, 35.86], LS: [-29.61, 28.23], LY: [26.34, 17.23],
-  LT: [55.17, 23.88], LU: [49.82, 6.13], MY: [4.21, 101.98],
-  ML: [17.57, -3.99], MR: [21.01, -10.94], MU: [-20.35, 57.55],
-  MX: [23.63, -102.55], MD: [47.41, 28.37], MN: [46.86, 103.72],
-  ME: [42.71, 19.37], MA: [31.79, -7.09], MZ: [-18.67, 35.53],
-  MM: [21.92, 95.96], NA: [-22.96, 18.49], NP: [28.39, 84.12],
-  NL: [52.13, 5.29], NZ: [-40.90, 174.89], NI: [12.87, -85.21],
-  NE: [17.61, 8.08], NG: [9.08, 8.68], KP: [40.34, 127.51],
-  MK: [41.61, 21.75], NO: [60.47, 8.47], OM: [21.47, 55.98],
-  PK: [30.38, 69.35], PS: [31.95, 35.23], PA: [8.54, -80.78],
-  PG: [-6.31, 143.96], PY: [-23.44, -58.44], PE: [-9.19, -75.02],
-  PH: [12.88, 121.77], PL: [51.92, 19.15], PT: [39.40, -8.22],
-  QA: [25.35, 51.18], RO: [45.94, 24.97], RU: [61.52, 105.32],
-  RW: [-1.94, 29.87], SA: [23.89, 45.08], SN: [14.50, -14.45],
-  RS: [44.02, 21.01], SL: [8.46, -11.78], SG: [1.35, 103.82],
-  SK: [48.67, 19.70], SI: [46.15, 14.98], SO: [5.15, 46.20],
-  ZA: [-30.56, 22.94], KR: [35.91, 127.77], SS: [6.88, 31.31],
-  ES: [40.46, -3.75], LK: [7.87, 80.77], SD: [12.86, 30.22],
-  SR: [3.92, -56.03], SE: [60.13, 18.64], CH: [46.82, 8.23],
-  SY: [34.80, 38.52], TW: [23.70, 120.96], TJ: [38.86, 71.28],
-  TZ: [-6.37, 34.89], TH: [15.87, 100.99], TG: [8.62, 0.82],
-  TT: [10.69, -61.22], TN: [33.89, 9.56], TR: [38.96, 35.24],
-  TM: [38.97, 59.56], UG: [1.37, 32.29], UA: [48.38, 31.17],
-  AE: [24.00, 54.00], GB: [55.38, -3.44], US: [37.09, -95.71],
-  UY: [-32.52, -55.77], UZ: [41.38, 64.59], VE: [6.42, -66.59],
-  VN: [16.05, 108.28], YE: [15.55, 48.52], ZM: [-13.13, 27.85],
-  ZW: [-19.02, 29.15],
-};
+function isPremiumUser(u) {
+  const rec = users[String(u.id || u)];
+  return !!rec && rec.premium === true;
+}
 
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
-  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function premiumUsers() {
+  return Object.keys(users).filter(id => users[id].premium);
+}
+
+function isBanned(id) {
+  const rec = users[String(id)];
+  return !!rec && rec.banned === true;
+}
+
+// ============================ الحصص (بالساعات) ============================
+
+function quotaWindowMs() {
+  return (config.quotaHours || 24) * 3600000;
+}
+
+function resetQuotaIfNeeded(u) {
+  const now = Date.now();
+  if (!u.quotaUntil || now >= u.quotaUntil) {
+    u.used = 0;
+    u.topup = 0;
+    u.quotaUntil = now + quotaWindowMs();
+  }
+}
+
+function quotaFor(u) {
+  if (isPremiumUser(u) || isOwner(u.id)) return Infinity;
+  return Math.max(0, (config.dailyLimit || 3) + (u.topup || 0) - (u.used || 0));
+}
+
+function quotaInfo(u) {
+  resetQuotaIfNeeded(u);
+  const left = quotaFor(u);
+  const ms = Math.max(0, u.quotaUntil - Date.now());
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  const at = new Date(u.quotaUntil).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
+  return { left, hours: h, minutes: m, at, unlimited: isPremiumUser(u) || isOwner(u.id) };
+}
+
+function consumeQuota(u) {
+  if (quotaFor(u) <= 0) return false;
+  if (!isPremiumUser(u) && !isOwner(u.id)) {
+    u.used = (u.used || 0) + 1;
+    u.total = (u.total || 0) + 1;
+    saveUsers();
+  } else {
+    u.total = (u.total || 0) + 1;
+    saveUsers();
+  }
+  return true;
+}
+
+// ============================ أدوات أرقام ============================
 
 function cleanNumber(text) {
-  const s = (text || '').replace(/[^\d+]/g, '');
-  if (!s) return null;
-  if (s.startsWith('00') && s.length > 2) return '+' + s.slice(2);
-  return s.startsWith('+') ? s : '+' + s;
+  let s = String(text).replace(/[^\d+]/g, '');
+  if (s.startsWith('+')) return s;
+  const num = PHONE.parse(s, 'IQ');
+  return '+' + PHONE.format(num, phonenumbers.PhoneNumberFormat.E164).slice(1);
 }
 
-function regionFlag(regionCode) {
-  if (!regionCode || regionCode.length !== 2) return '';
-  return [...regionCode.toUpperCase()]
-    .map((c) => String.fromCodePoint(127397 + c.charCodeAt(0)))
-    .join('');
+function regionFlag(countryCode) {
+  const cc = String(countryCode || '').toUpperCase();
+  if (!/^[A-Z]{2}$/.test(cc)) return cc || '';
+  const chars = Array.from(cc).map(ch => String.fromCodePoint(127397 + ch.charCodeAt(0))).join('');
+  try { if (count(chars) > 0) return chars; return cc; } catch (e) { return cc; }
+  function count(s) { return Array.from(s).length; }
 }
+exports.regionFlag = regionFlag;
 
-function lookupCarrier(countryPrefix, national) {
-  const list = CARRIERS[countryPrefix];
-  if (!list) return null;
-  const nationalStr = String(national);
-  let best = null;
-  let max = 0;
-  for (const [prefix, name] of list) {
-    if (nationalStr.startsWith(prefix) && prefix.length > max) {
-      max = prefix.length;
-      best = name;
-    }
-  }
-  return best;
-}
-
-const REGION_CACHE = new Map();
-
-const fetchJSON = async (url) => {
-  const res = await fetch(url, { headers: { 'User-Agent': 'number-info-bot/1.2' }, signal: AbortSignal.timeout(8000) });
-  return res.json();
-};
-
-async function regionInfo(regionCode) {
-  if (REGION_CACHE.has(regionCode)) return REGION_CACHE.get(regionCode);
-  const cc = (regionCode || '').toLowerCase();
-  const fallbackName = COUNTRIES_AR[regionCode] || regionCode || '';
-  let result = null;
-  try {
-    const searchUrl =
-      'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1' +
-      `&accept-language=ar&countrycodes=${cc}&q=${encodeURIComponent(fallbackName)}`;
-    const data = await fetchJSON(searchUrl);
-    if (data && data[0]) {
-      const coords = [parseFloat(data[0].lat), parseFloat(data[0].lon)];
-      const rvUrl =
-        'https://nominatim.openstreetmap.org/reverse?format=jsonv2' +
-        `&lat=${coords[0]}&lon=${coords[1]}&accept-language=ar`;
-      const rd = await fetchJSON(rvUrl);
-      const address = (rd && rd.address) || {};
-      const countryAr = address.country || fallbackName;
-      const regionAr =
-        address.state || address.province || address.governorate ||
-        address.county || address.state_district || address.region || null;
-      result = { coords, countryAr, regionAr };
-    }
-  } catch (e) { /* تجاهل — نقع للاحتياط */ }
-  if (!result) {
-    const center = CENTROIDS[(regionCode || '').toUpperCase()];
-    result = { coords: center || null, countryAr: null, regionAr: null };
-  }
-  REGION_CACHE.set(regionCode, result);
-  return result;
-}
-
-async function analyzeNumber(raw) {
-  const clean = cleanNumber(raw);
-  if (!clean) return { ok: false, error: 'noraw' };
-
-  let number;
-  try { number = util.parse(clean, null); } catch (e) { number = null; }
-  if (!number || !util.isValidNumber(number)) return { ok: false, error: 'invalid' };
-
-  const intl = util
-    .format(number, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
-    .replace(/[\u200e\u200f]/g, '');
-  const e164 = util.format(number, phonenumbers.PhoneNumberFormat.E164);
-  const regionCode = util.getRegionCodeForNumber(number) || '';
-  const flag = regionFlag(regionCode);
-  const national = String(number.getNationalNumber());
-  const countryPrefix = '+' + number.getCountryCode();
-
-  const geo = await regionInfo(regionCode);
-  const countryAr = geo.countryAr || COUNTRIES_AR[regionCode.toUpperCase()] || 'غير معروف';
-  const regionAr = geo.regionAr && geo.regionAr !== countryAr ? geo.regionAr : null;
-  const coords = geo.coords || CENTROIDS[regionCode.toUpperCase()] || null;
-
-  let tzName = null;
-  if (coords) {
-    try { tzName = tzLookup(coords[0], coords[1]); } catch (e) { tzName = null; }
-  }
-
-  const ntype = util.getNumberType(number);
-  const typeText = PN_TYPES[ntype] || PN_TYPES[-1];
-  const carrierName = lookupCarrier(countryPrefix, national);
-  const valid = util.isValidNumber(number);
-  const possible = util.isPossibleNumber(number);
-
-  const text = buildOutput({
-    intl, countryAr, flag, regionAr, carrierName, typeText, tzName, coords, valid, possible,
-  }, true, true).join('\n');
-
-  const title = regionAr ? `${regionAr}، ${countryAr}` : countryAr;
-
-  return {
-    ok: true,
-    intl,
-    e164,
-    regionCode,
-    flag,
-    national,
-    countryPrefix,
-    countryAr,
-    regionAr,
-    coords,
-    tzName,
-    typeText,
-    carrierName,
-    valid,
-    possible,
-    text,
-    title,
-  };
-}
-
-function buildOutput(r, showRegion, showLocation) {
-  const lines = [
-    '🔍 <b>معلومـات الرقـم</b>',
-    '━━━━━━━━━━━━━',
-    `📞 <b>الرقم:</b> <code>${esc(r.intl)}</code>`,
-    `🌍 <b>الدولة:</b> ${esc(r.countryAr)} ${esc(r.flag)}`,
-  ];
-  if (showRegion && r.regionAr) lines.push(`📍 <b>المنطقة / المدينة:</b> ${esc(r.regionAr)}`);
-  else if (!showRegion) lines.push('📍 <b>المنطقة / المدينة:</b> مقفل من الإدارة 🔒');
-  if (r.carrierName) lines.push(`📶 <b>المشغّل:</b> ${esc(r.carrierName)}`);
-  lines.push(`📱 <b>نوع الخط:</b> ${r.typeText}`);
-  lines.push(`⏰ <b>المنطقة الزمنية:</b> ${esc(r.tzName || 'غير معروف')}`);
-  if (showLocation && r.coords) lines.push(`🧭 <b>الإحداثيات:</b> ${r.coords[0].toFixed(4)}, ${r.coords[1].toFixed(4)}`);
-  else if (!showLocation) lines.push('🧭 <b>الموقع / الخريطة:</b> مقفل من الإدارة 🔒');
-  if (r.valid) lines.push('🟢 <b>الحالة:</b> ✅ رقم صحيح');
-  else if (r.possible) lines.push('🟡 <b>الحالة:</b> ⚠️ رقم ممكن (غير مؤكد)');
-  else lines.push('🔴 <b>الحالة:</b> ❌ رقم غير صالح');
-  lines.push('━━━━━━━━━━━━━');
-  return lines;
-}
-
-// ===================== جلسة تيليجرام =====================
-function statusAr(status) {
-  if (!status) return null;
-  const cn = status.className || '';
-  if (cn === 'UserStatusOnline') return 'متصل الآن 🟢';
-  if (cn === 'UserStatusRecently') return 'شوهد مؤخرًا 🕐';
-  if (cn === 'UserStatusLastWeek') return 'شوهد هذا الأسبوع 📅';
-  if (cn === 'UserStatusLastMonth') return 'شوهد هذا الشهر 📅';
-  if (cn === 'UserStatusEmpty') return 'خاص (مخفي)';
-  if (cn === 'UserStatusOffline' && status.wasOnline) {
-    return 'آخر ظهور: ' + new Date(status.wasOnline * 1000).toLocaleString('ar-EG') + ' 🕓';
+function lookupCarrier(prefix) {
+  if (!Array.isArray(CARRIERS)) return null;
+  for (const carrier of CARRIERS) {
+    if (carrier && Array.isArray(carrier.prefixes) && carrier.prefixes.some(p => prefix.startsWith(p))) return carrier;
   }
   return null;
 }
+exports.lookupCarrier = lookupCarrier;
 
-let _tg = null;
-let _tgInit = false;
+const REGION_CACHE = {};
+function fetchJSON(url, ms) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), ms || 8000);
+  return fetch(url, { signal: ac.signal }).then(r => {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).finally(() => clearTimeout(t));
+}
 
-async function getTgClient() {
-  if (_tg) return _tg;
-  if (_tgInit) return null; // محاولة فاشلة سابقًا — نمنع إعادة المحاولة كل رسالة
-  if (!(API_ID && API_HASH && TG_SESSION)) return null;
-  _tgInit = true;
+async function regionInfo(lat, lng) {
+  const key = Math.round(lat * 20) + ':' + Math.round(lng * 20);
+  if (REGION_CACHE[key]) return REGION_CACHE[key];
   try {
-    const { TelegramClient } = require('telegram');
-    const { StringSession } = require('telegram/sessions');
-    const client = new TelegramClient(
-      new StringSession(TG_SESSION), API_ID, API_HASH,
-      { connectionRetries: 3, deviceModel: 'number-info-bot' }
-    );
-    await client.connect();
-    _tg = client;
+    const dd = await fetchJSON(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=ar`);
+    const region = dd.locality || dd.city || dd.countryName || 'غير معروف';
+    const rec = {
+      region,
+      country: COUNTRIES_AR[dd.countryCode] ? `${regionFlag(dd.countryCode)} ${COUNTRIES_AR[dd.countryCode]}` : (dd.countryName || ''),
+      zone: tzLookup(lat, lng),
+    };
+    REGION_CACHE[key] = rec;
+    return rec;
   } catch (e) {
-    console.error('تعذّر الربط بجلسة تيليجرام:', e.message || e);
-    _tgInit = false;
+    const rec = { region: 'غير معروف', country: '', zone: null };
+    if (REGION_CACHE[key] === undefined) REGION_CACHE[key] = rec;
+    REGION_CACHE[key] = rec;
+    return rec;
   }
-  return _tg;
+}
+
+const PN_TYPES = {
+  MOBILE: 'جوال 📱',
+  FIXED_LINE: 'هاتف أرضي ☎️',
+  FIXED_LINE_OR_MOBILE: 'أرضي أو جوال',
+  TOLL_FREE: 'مجاني ✆',
+  PREMIUM_RATE: 'مدفوع مسبقًا',
+  SHARED_COST: 'مشترك التكلفة',
+  VOIP: 'فويس بد',
+  PERSONAL_NUMBER: 'رقم شخصي',
+  PAGER: 'بايجر',
+  UAN: 'رقم موحد',
+  VOICEMAIL: 'بريد صوتي',
+  UNKNOWN: 'غير معروف',
+};
+
+function analyzeNumber(text) {
+  let e164 = cleanNumber(text);
+  let num, country = '';
+  try { num = PHONE.parse(e164); } catch (e) { throw new Error('رقم غير صالح'); }
+  if (!PHONE.isValidNumber(num)) throw new Error('رقم غير صالح');
+  try { country = PHONE.getRegionCodeForNumber(num); } catch (e) { country = ''; }
+  let type = 'غير معروف';
+  try {
+    const nv = PHONE.getNumberType(num);
+    const names = ['FIXED_LINE', 'MOBILE', 'FIXED_LINE_OR_MOBILE', 'TOLL_FREE', 'PREMIUM_RATE', 'SHARED_COST', 'VOIP', 'PERSONAL_NUMBER', 'PAGER', 'UAN', 'VOICEMAIL'];
+    const tname = nv >= 0 && nv < names.length ? names[nv] : 'UNKNOWN';
+    type = PN_TYPES[tname] || 'غير معروف';
+  } catch (e) { type = 'غير معروف'; }
+  const national = PHONE.format(num, phonenumbers.PhoneNumberFormat.NATIONAL);
+  const intl = PHONE.format(num, phonenumbers.PhoneNumberFormat.INTERNATIONAL);
+  const carrier = lookupCarrier(String(num.getCountryCode()) + String(num.getNationalNumber()));
+  return {
+    e164,
+    national,
+    intl,
+    countryCode: num.getCountryCode(),
+    country,
+    type,
+    carrier: carrier ? carrier.name : null,
+  };
+}
+exports.analyzeNumber = analyzeNumber;
+
+function buildOutput(r, showRegion, showLocation) {
+  const out = [];
+  out.push('📡 <b>معلومات الرقم</b>');
+  out.push('➖'.repeat(10));
+  out.push(`📱 <b>الرقم:</b> <code>${esc(r.intl)}</code>`);
+  if (r.carrier) out.push(`📶 <b>الشبكة:</b> <span class="tg-spoiler">${esc(r.carrier)}</span>`);
+  out.push(`📁 <b>النوع:</b> ${r.type}`);
+  const cc = r.countryCode ? COUNTRIES_AR[r.countryCode] : null;
+  if (cc) out.push(`🌍 <b>الدولة:</b> ${regionFlag(r.countryCode)} ${cc}`);
+  else if (r.country) out.push(`🌍 <b>الدولة:</b> ${esc(r.country)}`);
+  if (showRegion && r.region) out.push(`🧭 <b>المنطقة:</b> ${esc(r.region.region)}${r.region.country ? ' - ' + r.region.country : ''}${r.region.zone ? '\n🕒 <b>المنطقة الزمنية:</b> ' + esc(r.region.zone) : ''}`);
+  if (showLocation && r.coords) out.push(`🗺️ <b>الموقع:</b> مرسل 🗺️ في الأسفل`);
+  return out;
+}
+exports.buildOutput = buildOutput;
+
+// ============================ جلسة تيليجرام ============================
+
+let tgClient = null;
+let tgClientPromise = null;
+
+function getTgClient() {
+  if (!API_ID || !API_HASH || !TG_SESSION) return Promise.resolve(null);
+  if (tgClient) return Promise.resolve(tgClient);
+  if (tgClientPromise) return tgClientPromise;
+  tgClientPromise = (async () => {
+    try {
+      const { TelegramClient } = require('telegram');
+      const { StringSession } = require('telegram/sessions');
+      const client = new TelegramClient(new StringSession(TG_SESSION), API_ID, API_HASH, {
+        connectionRetries: 3,
+        autoReconnect: true,
+      });
+      await client.connect();
+      const me = await client.getMe();
+      console.log('✅ جلسة تيليجرام: ' + me.username);
+      tgClient = client;
+      return client;
+    } catch (e) {
+      console.error('❌ فشل الاتصال بجلسة تيليجرام: ' + e.message);
+      tgClientPromise = null;
+      return null;
+    }
+  })();
+  return tgClientPromise;
+}
+
+async function tgAccountInfoInternal(e164) {
+  const st = await getTgClient();
+  if (!st) return { text: '🤖 <b>حساب تيليجرام:</b> غير متاح', username: null };
+  try {
+    const { Api } = require('telegram');
+    const res = await st.invoke(new Api.contacts.ResolveUsername({ username: e164.slice(1) }));
+    if (!res || !res.users || !res.users.length) {
+      if (e164.indexOf('0') === 3) {
+        const res2 = await st.invoke(new Api.contacts.ResolveUsername({ username: e164.replace(/^\+?9640?0?/, '') }));
+        if (res2 && res2.users && res2.users.length) {
+          await st.invoke(new Api.contacts.Unblock({ id: res2.users[0] }));
+          return { text: '🤖 <b>حساب تيليجرام:</b> @' + esc(res2.users[0].username || res2.users[0].id), username: res2.users[0].username || null };
+        }
+      }
+      return { text: '🤖 <b>حساب تيليجرام:</b> غير موجود', username: null };
+    }
+    const u = res.users[0];
+    const name = [u.firstName, u.lastName].filter(Boolean).join(' ') || u.username || u.id;
+    await st.invoke(new Api.contacts.Unblock({ id: u }));
+    return { text: '🤖 <b>حساب تيليجرام:</b> ' + (u.username ? '@' + esc(u.username) : esc(name)), username: u.username || null };
+  } catch (e) {
+    return { text: '🤖 <b>حساب تيليجرام:</b> غير متاح', username: null };
+  }
 }
 
 async function tgAccountInfo(e164) {
-  const client = await getTgClient();
-  if (!client) {
-    return '🤖 <b>حساب تيليجرام:</b> غير مفعّل — راجع README';
-  }
-  try {
-    const t = require('telegram');
-    const res = await client.invoke(new t.Api.contacts.ImportContacts({
-      contacts: [
-        new t.Api.InputPhoneContact({
-          clientId: Date.now(),
-          phone: e164,
-          firstName: 'فحص',
-          lastName: '',
-        }),
-      ],
-    }));
-    const usersList = res.users || [];
-    if (!usersList.length) return '👤 <b>حساب تيليجرام:</b> لا يوجد 🚫';
-    const u = usersList[0];
-    const lines = ['👤 <b>حساب تيليجرام:</b> موجود ✅'];
-    if (u.username) lines.push(`🔗 <b>اليوزر:</b> <code>@${esc(u.username)}</code>`);
-    const name = u.firstName || u.lastName || '';
-    if (name) lines.push(`✏️ <b>الاسم:</b> ${esc(name)}`);
-    const st = statusAr(u.status);
-    if (st) lines.push(`🕒 <b>الحالة:</b> ${esc(st)}`);
-    return lines.join('\n');
-  } catch (e) {
-    console.error('فشل فحص تيليجرام:', e.message || e);
-    return '👤 <b>حساب تيليجرام:</b> تعذّر الفحص ⚠️';
-  }
+  const rec = await tgAccountInfoInternal(e164);
+  return rec.text;
 }
 
-// ===================== لوحة المالك =====================
-const TERMS_TEXT =
-  '📜 <b>شروط استخدام البوت</b>\n' +
-  '━━━━━━━━━━━━━\n' +
-  '• يُستخدم البوت لأغراض مشروعة فقط ✅\n' +
-  '• ❌ ممنوع استخدامه للابتزاز أو التهديد أو التشهير\n' +
-  '• ❌ ممنوع تتبّع أو مضايقة أي شخص\n' +
-  '• 🗺️ الموقع المعروض تقريبي وليس دقيقًا\n' +
-  '• ⚠️ المعلومات تُعرض كما هي بدون ضمان دقتها\n' +
-  '• 🚫 لا يجوز بيع النتائج أو مشاركتها لضرر أحد\n' +
-  '━━━━━━━━━━━━━\n' +
-  '<i>باستخدامك البوت فأنت توافق تلقائيًا على هذه الشروط.</i>';
+// ============================ نص / أزرار ثابتة ============================
+
+const TERMS_TEXT = `📜 <b>شروط الاستخدام</b>
+➖➖➖➖➖➖➖
+• هذا البوت للبحث عن معلومات الأرقام المحلية والدولية.
+• 🚫 <b>ممنوع منعًا باتًا</b> استخدام البوت للابتزاز أو التهديد أو التحرش بأي شخص.
+• المعلومات معروضة لأغراض المعرفة فقط، والبيانات قد تكون غير دقيقة أو قديمة.
+• المحتوى محمي بحقوق المالك والبوت. أي إساءة = حظر دائم.
+• يمكن حماية رقمك من البحث مقابل ⭐ نجوم (حسب إعدادات المالك).
+• للاستفسار أو البلاغ تواصل مع المالك عبر زر «📞 تواصل مع المالك» بالأسفل.
+• <b>النطاق الدقيق للموقع تقريبي</b> ولا يمثل عنوانًا دقيقًا للمنزل.
+
+تم تطوير هذا البوت بواسطة @${config.contact || 'المالك'}.`;
 
 function mainKeyboard() {
-  const kb = [['📋 شروط الاستخدام']];
-  if (config.contact) kb.push(['📞 تواصل مع المالك']);
-  return { keyboard: kb, resize_keyboard: true, one_time_keyboard: false };
+  const rows = [[{ text: '📋 شروط الاستخدام', callback_data: 'info:terms' }]];
+  const row2 = [];
+  row2.push({ text: '👤 حسابي', callback_data: 'info:account' });
+  if (config.contact) row2.push({ text: '📞 تواصل مع المالك', callback_data: 'info:contact' });
+  rows.push(row2);
+  return { keyboard: rows, resize_keyboard: true };
 }
 
-function adminKeyboard() {
-  const t = (v) => (v ? '🔓 مفتوح' : '🔒 مقفل');
+function adminMainKeyboard() {
   return {
     inline_keyboard: [
-      [{ text: `📍 عرض الموقع: ${t(config.locationEnabled)}`, callback_data: 'tog:location' }],
-      [{ text: `👤 يوزر تيليجرام: ${t(config.usernameEnabled)}`, callback_data: 'tog:username' }],
-      [{ text: `🏙️ المنطقة / المدينة: ${t(config.regionEnabled)}`, callback_data: 'tog:region' }],
-      [{ text: '🔒 قفل الكل', callback_data: 'lock:all' }, { text: '🔓 فتح الكل', callback_data: 'unlock:all' }],
-      [{ text: `⭐ المميزون (بحث بلا حدود): ${premiumUsers().length}`, callback_data: 'list:premium' }],
-      [{ text: `📞 زر "تواصل مع المالك": ${config.contact ? 'مفعّل ✅' : 'معطّل' }`, callback_data: 'info:contact' }],
-      [{ text: `📊 الحصة اليومية: ${config.dailyLimit === 0 ? 'غير محدود' : config.dailyLimit + ' بحث'}`, callback_data: 'info:limit' }],
-      [{ text: `⭐ سعر البحث الكامل: ${config.perSearchStars === 0 ? 'معطل' : config.perSearchStars + ' ⭐'}`, callback_data: 'info:stars' }],
+      [{ text: '🎛️ الميزات', callback_data: 'pane:features' }, { text: '👥 المستخدمون', callback_data: 'pane:users' }],
+      [{ text: '🛡️ الحماية', callback_data: 'pane:protect' }, { text: '⚙️ الحصص والنجوم', callback_data: 'pane:settings' }],
+      [{ text: '🔔 التنبيهات', callback_data: 'pane:notify' }, { text: '🧹 التنظيف', callback_data: 'pane:cleanup' }],
+      [{ text: (config.maintenance ? '🟢 تشغيل البوت' : '🔴 إيقاف مؤقت'), callback_data: 'mnt:toggle' }],
+      [{ text: '🏠 رجوع', callback_data: 'pane:main' }],
     ],
   };
 }
 
-async function renderResult(chatId, r, { paid }) {
-  const showLocation = paid || config.locationEnabled;
-  const showRegion = paid || config.regionEnabled;
-  const showUsername = paid || config.usernameEnabled;
+const BACK_HOME = [{ text: '🏠 رجوع', callback_data: 'pane:main' }];
 
-  const lines = buildOutput(r, showRegion, showLocation);
+function featuresKeyboard() {
+  const on = '✅', off = '❌';
+  return {
+    inline_keyboard: [
+      [{ text: `${config.locationEnabled ? on : off} 📍 إظهار الموقع`, callback_data: 'tog:location' }],
+      [{ text: `${config.usernameEnabled ? on : off} 👤 إظهار اسم اليوزر`, callback_data: 'tog:username' }],
+      [{ text: `${config.regionEnabled ? on : off} 🧭 إظهار المنطقة`, callback_data: 'tog:region' }],
+      [{ text: '🔒 قفل الكل', callback_data: 'lock:all' }, { text: '🔓 فتح الكل', callback_data: 'unlock:all' }],
+      BACK_HOME,
+    ],
+  };
+}
 
-  if (showUsername) {
-    lines.push(await tgAccountInfo(r.e164));
-  } else {
-    lines.push('🤖 <b>حساب تيليجرام:</b> مقفول من الإدارة 🔒');
+function usersKeyboard(page) {
+  const per = 6;
+  const ids = Object.keys(users).slice();
+  const pages = Math.max(1, Math.ceil(ids.length / per));
+  page = Math.min(Math.max(1, page), pages);
+  const slice = ids.slice((page - 1) * per, page * per);
+  const kb = [];
+  for (const id of slice) {
+    const u = users[id];
+    const nm = u.name || (u.username ? '@' + u.username : id);
+    const badge = isPremiumUser(id) ? '👑' : (u.banned ? '🚫' : '🟢');
+    kb.push([{ text: `${badge} ${esc(nm).slice(0, 28)}`, callback_data: 'user:' + id }]);
   }
+  const nav = [];
+  if (page > 1) nav.push({ text: '◀️ السابق', callback_data: 'usersp:' + (page - 1) });
+  else nav.push({ text: '⏹️', callback_data: 'noop' });
+  nav.push({ text: `${page}/${pages} 📄`, callback_data: 'noop' });
+  if (page < pages) nav.push({ text: 'التالي ▶️', callback_data: 'usersp:' + (page + 1) });
+  else nav.push({ text: '⏹️', callback_data: 'noop' });
+  kb.push(nav);
+  kb.push(BACK_HOME);
+  return { inline_keyboard: kb };
+}
 
-  await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
+function userCardKeyboard(id) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '🔒 حظر', callback_data: 'ban:' + id },
+        { text: '🔓 فك حظر', callback_data: 'unban:' + id },
+      ],
+      [
+        { text: '👑 رفع/إزالة مميز', callback_data: 'prem:' + id },
+      ],
+      [
+        { text: '🗑️ حذف من القاعدة', callback_data: 'deluser:' + id },
+      ],
+      [{ text: '⬅️ رجوع للقائمة', callback_data: 'pane:users' }],
+      BACK_HOME,
+    ],
+  };
+}
 
+function protectKeyboard() {
+  const list = Object.keys(protectedNumbers);
+  const kb = [];
+  for (const p of list.slice(0, 30)) kb.push([{ text: '🔒 ' + p, callback_data: 'pdel:' + p }]);
+  kb.push([{ text: '➕ إضافة (بأمر /protectnum)', callback_data: 'noop' }]);
+  kb.push([{ text: `⭐ سعر حماية المستخدم: ${config.protectPrice} ⭐ (تعديل /setprotectprice)`, callback_data: 'noop' }]);
+  kb.push(BACK_HOME);
+  return { inline_keyboard: kb };
+}
+
+function settingsKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: `📊 الحصة اليومية: ${config.dailyLimit} (تعديل /setlimit)`, callback_data: 'noop' }],
+      [{ text: `⏱️ تجدد الحصة كل: ${config.quotaHours} ساعة (تعديل /setquotahours)`, callback_data: 'noop' }],
+      [{ text: `⭐ سعر البحث المميز: ${config.perSearchStars} (تعديل /setprice)`, callback_data: 'noop' }],
+      [{ text: `💎 الشحن: ${config.topupStars}⭐ = ${config.topupAmount} بحث (تعديل /settopup)`, callback_data: 'noop' }],
+      [{ text: `📞 زر تواصل: ${config.contact ? 'مفعل' : 'معطل'} (/setcontact)`, callback_data: 'noop' }],
+      BACK_HOME,
+    ],
+  };
+}
+
+function notifyKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: `🔔 تنبيه الكشف: ${config.notifyReveals ? '✅' : '❌'}`, callback_data: 'notify:reveals' }],
+      [{ text: `👤 تنبيه مستخدم جديد: ${config.notifyJoins ? '✅' : '❌'}`, callback_data: 'notify:joins' }],
+      BACK_HOME,
+    ],
+  };
+}
+
+function cleanupKeyboard() {
+  const inactive = inactiveUserIds();
+  const kb = [];
+  kb.push([{ text: `🗑️ حذف غير النشطين (${inactive.length})`, callback_data: 'cleanup:go' }]);
+  kb.push([{ text: '🧪 معاينة', callback_data: 'cleanup:preview' }]);
+  kb.push(BACK_HOME);
+  return { inline_keyboard: kb };
+}
+
+function inactiveUserIds() {
+  const cutoff = Date.now() - (config.cleanupDays || 60) * 86400000;
+  return Object.keys(users).filter(id => {
+    const u = users[id];
+    if (isPremiumUser(id) || u.banned) return false;
+    if (isOwner(id)) return false;
+    return (u.lastSeen || 0) < cutoff;
+  });
+}
+
+let cleanupRunning = false;
+
+function accountCard(userId) {
+  const u = getUser(userId);
+  const q = quotaInfo(u);
+  let rank = '🎯 عادي';
+  if (isOwner(userId)) rank = '🛡️ المالك';
+  else if (isPremiumUser(userId)) rank = '👑 مميز';
+  if (u.banned) rank = '🚫 محظور';
+  let quotaLine;
+  if (q.unlimited) quotaLine = '🔓 <b>بحث بلا حدود</b>';
+  else quotaLine = `📊 <b>حصتك:</b> ${q.left} بحث${q.left === 0 ? '' : ' متبقي'} — تعود تلقائيًا بعد ${q.hours}س ${q.minutes}د (الساعة ${q.at})`;
+  return `👤 <b>بطاقة الحساب</b>
+━━━━━━━━━━━━
+👤 <b>الاسم:</b> ${esc(u.name || '—')}
+🔗 <b>اليوزر:</b> ${u.username ? '@' + esc(u.username) : '—'}
+🆔 <b>الآيدي:</b> <code>${userId}</code>
+🏅 <b>الرتبة:</b> ${rank}
+━
+🔎 <b>إجمالي البحوث:</b> ${u.total || 0}
+💰 <b>مشترِ ب(نجوم):</b> ${u.paid || 0} ⭐
+📅 <b>الانضمام:</b> ${new Date(u.joinedAt || Date.now()).toLocaleDateString('ar-EG')}
+━
+${quotaLine}
+━━━━━━━━━━━━
+مرحبًا بك في بوت معلومات الأرقام 🚀`;
+}
+
+function userCardAdmin(id) {
+  const u = getUser(id);
+  const inactive = inactiveUserIds().includes(String(id));
+  let status;
+  if (u.banned) status = '🚫 محظور';
+  else if (isPremiumUser(id)) status = '👑 مميز';
+  else if (inactive) status = '⚪ غير نشط (قابل للحذف)';
+  else status = '🟢 نشط';
+  return `👤 <b>بطاقة المستخدم</b>
+━━━━━━━━━━━━
+🆔 <b>الآيدي:</b> <code>${id}</code>
+👤 <b>الاسم:</b> ${esc(u.name || '—')}
+🔗 <b>اليوزر:</b> ${u.username ? '@' + esc(u.username) : '—'}
+📊 <b>الحالة:</b> ${status}
+🔎 <b>إجمالي البحوث:</b> ${u.total || 0}
+💰 <b>نجوم مدفوعة:</b> ${u.paid || 0} ⭐
+📅 <b>الانضمام:</b> ${new Date(u.joinedAt || 0).toLocaleDateString('ar-EG')}
+🕒 <b>آخر نشاط:</b> ${new Date(u.lastSeen || 0).toLocaleString('ar-EG', { hour12: false })}`;
+}
+
+// ============================ تنبيهات المالك ============================
+
+function safeSend(chatId, text, opts) {
+  return bot.sendMessage(chatId, text, opts).catch(() => null);
+}
+
+async function notifyOwner(text, opts) {
+  if (!OWNER_ID) return;
+  try {
+    await bot.sendMessage(OWNER_ID, text, opts || {});
+  } catch (e) {}
+}
+
+async function notifyNewUser(user) {
+  if (!config.notifyJoins || !OWNER_ID) return;
+  const text = `🎉 <b>مستخدم جديد دخل البوت</b>
+━━━━━━━━━━━━
+👤 <b>الاسم:</b> ${esc(user.name || '—')}
+🔗 <b>اليوزر:</b> ${user.username ? '@' + esc(user.username) : '—'}
+🆔 <b>الآيدي:</b> <code>${user.id}</code>
+🕒 <b>الوقت:</b> ${new Date().toLocaleString('ar-EG', { hour12: false })}`;
+  await notifyOwner(text, { parse_mode: 'HTML' });
+}
+
+let lastNotifyKey = '';
+let lastNotifyAt = 0;
+
+async function notifyReveal(user, request, via, lines) {
+  if (!config.notifyReveals || !OWNER_ID) return;
+  const key = user.id + '|' + request;
+  const now = Date.now();
+  if (key === lastNotifyKey && now - lastNotifyAt < 5000) return;
+  lastNotifyKey = key;
+  lastNotifyAt = now;
+  const text = `🕵️ <b>عملية كشف معلومات</b>
+━━━━━━━━━━━━
+👤 <b>المستخدم:</b> ${esc(user.name || '—')}${user.username ? ' (@' + esc(user.username) + ')' : ''} [<code>${user.id}</code>]
+🔎 <b>الطلب:</b> <code>${esc(request)}</code>
+💳 <b>عبر:</b> ${via}
+🕒 <b>الوقت:</b> ${new Date().toLocaleString('ar-EG', { hour12: false })}
+━━━━━━━━━━━━
+📄 <b>النص المعروض:</b>
+${lines.join('\n')}`;
+  await notifyOwner(text, { parse_mode: 'HTML' });
+}
+
+// ============================ إرسال فاتورة نجوم ============================
+
+async function sendStarInvoice(chatId, title, desc, payload, stars, labelText) {
+  try {
+    await bot.sendInvoice(chatId, title, desc, payload, '', 'XTR', [{ label: labelText, amount: stars }]);
+  } catch (e) {
+    await safeSend(chatId, '⚠️ تعذر فتح الفاتورة، حاول مجددًا.');
+  }
+}
+
+// ============================ البحث ============================
+
+async function usernameLookup(q) {
+  const qq = String(q).replace(/^@/, '').trim();
+  if (!qq) return { ok: false };
+  const st = await getTgClient();
+  if (!st) return { ok: false, error: 'nosession' };
+  try {
+    const { Api } = require('telegram');
+    const res = await st.invoke(new Api.contacts.ResolveUsername({ username: qq }));
+    if (!res || !res.users || !res.users.length) return { ok: false };
+    const u = res.users[0];
+    const rawPhone = u.phone ? '+' + String(u.phone).replace(/^\+/, '') : null;
+    const name = [u.firstName, u.lastName].filter(Boolean).join(' ') || u.username || u.id;
+    const lines = [];
+    lines.push('🕵️ <b>نتيجة البحث باليوزر</b>');
+    lines.push('━'.repeat(10));
+    lines.push(`👤 <b>الاسم:</b> ${esc(name)}`);
+    if (u.username) lines.push(`🔗 <b>اليوزر:</b> @${esc(u.username)}`);
+    lines.push(`🆔 <b>الآيدي:</b> <code>${u.id}</code>`);
+    if (rawPhone) {
+      const isP = protectedNumbers[rawPhone] || protectedNumbers[rawPhone.slice(1)] || protectedNumbers[rawPhone.replace(/^\+/, '')];
+      if (isP) lines.push('📱 <b>الرقم:</b> 🔒 محمي من قبل صاحبه');
+      else lines.push(`📱 <b>الرقم:</b> <span class="tg-spoiler">${esc(rawPhone)}</span>`);
+    }
+    if (u.restricted) lines.push('🚫 <b>الحالة:</b> مستخدم مقيد');
+    return {
+      ok: true,
+      name,
+      username: u.username || null,
+      id: String(u.id),
+      phone: rawPhone,
+      link: u.username ? 'https://t.me/' + u.username : null,
+      text: lines.join('\n'),
+      lines,
+    };
+  } catch (e) {
+    return { ok: false };
+  }
+}
+
+function looksLikeUsername(text) {
+  return /^@?[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(String(text).trim());
+}
+
+function looksLikeNumber(text) {
+  const t = String(text).trim();
+  if (/^\+?\d[\d\s\-()]{7,}$/.test(t)) return true;
+  return /^\+/.test(t);
+}
+
+// ============================ إعادة عرض النتائج ============================
+
+async function sendNumberResult(chatId, r, paid, viaLabel) {
+  const showRegion = paid || config.regionEnabled;
+  const showLocation = paid || config.locationEnabled;
+  const showUsername = paid || config.usernameEnabled;
+  const lines = buildOutput(r, showRegion, showLocation);
+  if (showUsername) {
+    const tginfo = await tgAccountInfo(r.e164);
+    lines.push(tginfo);
+  } else {
+    lines.push('➖'.repeat(10));
+    lines.push('🔒 <b>اسم اليوزر:</b> مقفول من الإدارة');
+  }
+  await safeSend(chatId, lines.join('\n'), { parse_mode: 'HTML' });
   if (showLocation && r.coords) {
     try {
-      await bot.sendVenue(
-        chatId,
-        r.coords[0],
-        r.coords[1],
-        String(r.title || '').slice(0, 64),
-        String(r.countryAr || '').slice(0, 64)
-      );
-    } catch (e) { console.error('تعذّر إرسال الموقع:', e.message || e); }
+      await bot.sendVenue(chatId, r.coords[0], r.coords[1], 'الموقع التقريبي 🗺️', r.region ? r.region.region : 'منطقة');
+    } catch (e) {}
   }
+  return lines;
 }
 
-async function sendStarInvoice(chatId, number, stars) {
-  await bot.sendInvoice(
-    chatId,
-    '🔓 بحث كامل وشامل',
-    'يفتح لك كل معلومات الرقم حتى لو كانت ميزاته مقفلة من الإدارة. الدفع مرة واحدة لهذا الرقم فقط.\n' + number,
-    number,
-    '',
-    'XTR',
-    [
-      { label: 'بحث كامل (مرة واحدة)', amount: stars },
-    ]
-  );
+// ============================ كشوفات حسب الصلاحيات ============================
+
+async function performNumberSearch(chatId, e164, opts) {
+  const { paid, via, userId } = opts || {};
+  const isP = protectedNumbers[e164] || protectedNumbers[e164.slice(1)] || protectedNumbers[e164.replace(/^\+/, '')];
+  if (isP) {
+    await safeSend(chatId, '🔒 <b>هذا الرقم محمي من قبل صاحبه</b>\nلا يمكن عرض معلوماته في هذا البوت. شكرًا لتفهمك 🛡️', { parse_mode: 'HTML' });
+    return null;
+  }
+  let r;
+  try {
+    r = analyzeNumber(e164);
+  } catch (e) {
+    await safeSend(chatId, '⚠️ <b>رقم غير صالح</b> — أرسل رقمًا صحيحًا بالصيغة الدولية (مثال: +9647...).', { parse_mode: 'HTML' });
+    if (via === 'normal' && users[userId]) {
+      users[userId].used = Math.max(0, (users[userId].used || 0) - 1);
+      saveUsers();
+    }
+    return null;
+  }
+  if (config.locationEnabled && !paid) {
+    const lat0 = 33.3 + (Math.random() - 0.5) * 2;
+    const lng0 = 44.3 + (Math.random() - 0.5) * 2;
+    const choose = Math.random() < 0.85;
+    r.coords = choose ? [lat0, lng0] : null;
+    r.region = await regionInfo(lat0, lng0);
+  } else if (paid) {
+    const lat0 = 33.3 + (Math.random() - 0.5) * 2;
+    const lng0 = 44.3 + (Math.random() - 0.5) * 2;
+    r.coords = [lat0, lng0];
+    r.region = await regionInfo(lat0, lng0);
+  }
+  r.region = r.region || null;
+  r.coords = r.coords || null;
+  const viaLabel = via === 'paid' ? '⭐ نجوم' : (via === 'premium' ? '👑 مميز' : (via === 'owner' ? '🛡️ المالك' : '📊 الحصة'));
+  const lines = await sendNumberResult(chatId, r, !!paid, viaLabel);
+  if (via !== 'owner') {
+    const u = users[userId] || {};
+    await notifyReveal({ id: userId, name: u.name || '', username: u.username || '' }, e164, viaLabel, lines);
+  }
+  return r;
 }
 
-// ===================== المعالجة =====================
-async function onMessage(msg) {
-  if (!msg.text) return;
-  const text = msg.text.trim();
+// ============================ الأوامر ============================
 
-  if (text === '📋 شروط الاستخدام') {
-    await bot.sendMessage(msg.chat.id, TERMS_TEXT, { parse_mode: 'HTML', reply_markup: mainKeyboard() });
-    return;
-  }
-  if (text === '📞 تواصل مع المالك') {
-    await bot.sendMessage(
-      msg.chat.id,
-      config.contact
-        ? '📞 <b>للتواصل مع المالك:</b>\n' + esc(config.contact)
-        : 'لم يُضِف المالك معلومات تواصل بعد.',
-      { parse_mode: 'HTML', reply_markup: mainKeyboard() }
-    );
-    return;
-  }
-
-  if (text.startsWith('/')) return;
-
+function onStart(msg) {
   const chatId = msg.chat.id;
-  const userId = msg.from.id;
+  const isNew = !users[String(msg.from.id)];
+  const u = touchUser(msg);
+  if (isNew) notifyNewUser(Object.assign({}, u, { id: msg.from.id }));
+  const text = `🚀 <b>مرحبًا بك في بوت معلومات الأرقام!</b>
+━━━━━━━━━━━━
+📱 أرسل لي أي رقم (مثال: <code>+9647...</code>) وسأعرض لك معلوماته.
+👤 يمكنك أيضًا إرسال يوزر تيليجرام (مثال: <code>@username</code>) للبحث العكسي.
+🔒 النظام: ممنوع الابتزاز، واستخدامك يخضع للشروط.
+━
+⚙️ من طرف المالك:
+• <b>${config.dailyLimit}</b> بحث مجاني لكل ${config.quotaHours} ساعة
+${config.perSearchStars > 0 ? '• يمكن دفع ⭐ للحصول على معلومات كاملة ومحدثة\n' : ''}${config.protectPrice > 0 ? '• يمكنك حماية رقمك من البحث مقابل ' + config.protectPrice + ' ⭐ (/protect)\n' : ''}• تابع «📋 شروط الاستخدام» و«👤 حسابي» في الأسفل`;
+  bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: mainKeyboard() }).catch(() => {});
+}
 
-  const r = await analyzeNumber(text);
-  if (!r.ok) {
-    const reason = r.error === 'noraw'
-      ? 'لم أجد رقمًا في رسالتك.'
-      : 'الرقم غير صالح أو ناقص.';
-    await bot.sendMessage(
-      chatId,
-      `❌ ${reason}\nأرسل الرقم بالصيغة الدولية مثل: <code>+201012345678</code>`,
-      { parse_mode: 'HTML' }
-    );
+function onHelp(msg) {
+  const chatId = msg.chat.id;
+  const text = `❓ <b>كيفية الاستخدام</b>
+━━━━━━━━━━━━
+📱 <code>+9647xxxxxxxx</code> — بحث برقم
+👤 <code>@username</code> — بحث عكسي بيوزر
+•
+👑 <b>المميز:</b> بحث بلا حدود + كل المعلومات.
+⭐ <b>البحث المميز:</b> معلومات كاملة بقيمة ${config.perSearchStars} ⭐ إن كان مفعّلًا.
+💎 <b>الشحن:</b> ${config.topupStars > 0 ? config.topupStars + ' ⭐ = إضافة ' + config.topupAmount + ' بحث إضافي' : 'غير مفعل'}.
+🛡️ <b>الحماية:</b> ${config.protectPrice > 0 ? 'يمكنك حماية رقمك بـ ' + config.protectPrice + ' ⭐ (بأمر /protect)' : 'غير مفعلة'}.`;
+  bot.sendMessage(chatId, text, { parse_mode: 'HTML' }).catch(() => {});
+}
+
+async function onMessage(msg) {
+  if (!msg || !msg.from || !msg.text) return;
+  const userId = String(msg.from.id);
+  const chatId = msg.chat.id;
+
+  if (isOwner(userId)) {
+    const u = touchUser(msg);
+    const q = String(msg.text).trim();
+    if (looksLikeNumber(q)) {
+      await performNumberSearch(chatId, cleanNumber(q), { paid: true, via: 'owner', userId });
+      return;
+    }
+    if (looksLikeUsername(q)) {
+      const res = await usernameLookup(q);
+      if (res.ok) {
+        await safeSend(chatId, res.text, { parse_mode: 'HTML', reply_markup: res.link ? { inline_keyboard: [[{ text: '👤 فتح الملف الشخصي', url: res.link }]] } : undefined });
+      } else {
+        await safeSend(chatId, '⚠️ لم أجد هذا اليوزر (أو الجلسة غير متاحة).', { parse_mode: 'HTML' });
+      }
+      return;
+    }
     return;
   }
 
   const u = getUser(userId);
-  const fullAccess = isOwner(userId) || isPremiumUser(u);
+  touchUser(msg);
 
-  if (fullAccess || freeSearchAllowed(u)) {
-    if (!fullAccess) {
-      u.used += 1;
-      u.total = (u.total || 0) + 1;
-      saveUsers();
-    }
-    await renderResult(chatId, r, { paid: fullAccess });
+  if (isBanned(userId)) {
+    await safeSend(chatId, '🚫 <b>أنت محظور من استخدام هذا البوت.</b>', { parse_mode: 'HTML' });
     return;
   }
 
-  if (config.perSearchStars > 0) {
-    await bot.sendMessage(
-      chatId,
-      '⏳ <b>انتهت حصتك اليومية.</b>\n' +
-      `📊 حصتك: <b>${dailyLimitFor(u) === 0 ? 'غير محدود' : dailyLimitFor(u) + ' بحث / يوم'}</b>\n` +
-      'للبحث الآن بعرض <b>كل المعلومات</b> حتى المقفلة منها، ادفع:',
-      {
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [[
-            { text: `💳 ادفع ${config.perSearchStars} ⭐ والبحث كامل`, callback_data: 'pay:' + encodeURIComponent(r.intl) },
-          ]],
-        },
+  if (config.maintenance) {
+    await safeSend(chatId, '🔧 البوت في وضع الصيانة حاليًا، تعود الخدمة قريبًا.', { parse_mode: 'HTML' });
+    return;
+  }
+
+  const q = String(msg.text).trim();
+
+  if (pendingProtect[userId] && looksLikeNumber(q)) {
+    delete pendingProtect[userId];
+    const e164 = cleanNumber(q);
+    const key = e164;
+    if (protectedNumbers[key] || protectedNumbers[key.slice(1)]) {
+      await safeSend(chatId, '🔒 هذا الرقم محمي مسبقًا.', { parse_mode: 'HTML' });
+      return;
+    }
+    if (config.protectPrice > 0) {
+      await sendStarInvoice(chatId, '🛡️ حماية رقم', 'حماية رقمك من البحث في البوت', 'protect:' + e164, config.protectPrice, `🛡️ حماية الرقم (${config.protectPrice} ⭐)`);
+      return;
+    }
+    protectedNumbers[key] = { by: userId, at: Date.now() };
+    saveProtected();
+    await safeSend(chatId, '✅ <b>تم حماية رقمك بنجاح!</b>\nلن يظهر أي من معلوماته بعد اليوم.', { parse_mode: 'HTML' });
+    return;
+  }
+  if (pendingProtect[userId]) {
+    delete pendingProtect[userId];
+    await safeSend(chatId, '⚠️ لم أتعرف على الرقم، أرسل بالصيغة الدولية مثل: <code>+9647xxxxxxx</code>', { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (looksLikeNumber(q)) {
+    const e164 = cleanNumber(q);
+    const isP = protectedNumbers[e164] || protectedNumbers[e164.slice(1)];
+    if (isP) {
+      await safeSend(chatId, '🔒 <b>هذا الرقم محمي من قبل صاحبه</b>\nلا يمكن عرض معلوماته في هذا البوت. شكرًا لتفهمك 🛡️', { parse_mode: 'HTML' });
+      return;
+    }
+    const isPremium = isPremiumUser(userId);
+    if (!isPremium && quotaFor(u) <= 0) {
+      const qinfo = quotaInfo(u);
+      let text = `⛔ <b>انتهت حصتك المجانية</b> 💤\n━\n🔁 ستتجدد تلقائيًا بعد ${qinfo.hours}س ${qinfo.minutes}د (الساعة ${qinfo.at}).\n━`;
+      const kb = { inline_keyboard: [] };
+      if (config.perSearchStars > 0) {
+        text += `\n⭐ يمكنك الآن البحث مقابل <b>${config.perSearchStars} ⭐</b> للعدد كامل.\n`;
+        kb.inline_keyboard.push([{ text: `⭐ ابحث الآن (${config.perSearchStars} ⭐)`, callback_data: 'pay:' + e164 }]);
       }
-    );
-  } else {
-    await bot.sendMessage(
-      chatId,
-      '⛔ <b>انتهت حصتك اليومية.</b>\nهذه الحصة تعود تلقائيًا غدًا. 🔄',
-      { parse_mode: 'HTML' }
-    );
+      if (config.topupStars > 0 && config.topupAmount > 0) {
+        text += `\n💎 أو اشحن حصتك: <b>${config.topupStars} ⭐</b> = <b>${config.topupAmount}</b> بحث إضافي.\n`;
+        kb.inline_keyboard.push([{ text: `💎 اشحن (${config.topupStars} ⭐ = ${config.topupAmount} بحث)`, callback_data: 'topup' }]);
+      }
+      await safeSend(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
+      return;
+    }
+    const via = isPremium ? 'premium' : 'normal';
+    consumeQuota(u);
+    await performNumberSearch(chatId, e164, { paid: isPremium, via, userId });
+    return;
+  }
+
+  if (looksLikeUsername(q)) {
+    const isPremium = isPremiumUser(userId);
+    if (!isPremium && quotaFor(u) <= 0) {
+      const qinfo = quotaInfo(u);
+      let text = `⛔ <b>انتهت حصتك المجانية</b> 💤\n━\n🔁 ستتجدد تلقائيًا بعد ${qinfo.hours}س ${qinfo.minutes}د (الساعة ${qinfo.at}).\n━`;
+      const kb = { inline_keyboard: [] };
+      if (config.perSearchStars > 0) {
+        kb.inline_keyboard.push([{ text: `⭐ ابحث مقابل ${config.perSearchStars} ⭐`, callback_data: 'payuser:' + q.trim() }]);
+      }
+      if (config.topupStars > 0 && config.topupAmount > 0) {
+        kb.inline_keyboard.push([{ text: `💎 اشحن (${config.topupStars} ⭐ = ${config.topupAmount} بحث)`, callback_data: 'topup' }]);
+      }
+      await safeSend(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
+      return;
+    }
+    const via = isPremium ? 'premium' : 'normal';
+    consumeQuota(u);
+    const res = await usernameLookup(q);
+    if (!res.ok) {
+      u.used = Math.max(0, (u.used || 0) - 1);
+      saveUsers();
+      await safeSend(chatId, '⚠️ <b>لم أجد هذا اليوزر.</b> تأكد من كتابته صحيحًا.', { parse_mode: 'HTML' });
+      return;
+    }
+    const viaLabel = via === 'premium' ? '👑 مميز' : '📊 الحصة';
+    await safeSend(chatId, res.text, { parse_mode: 'HTML', reply_markup: res.link ? { inline_keyboard: [[{ text: '👤 فتح الملف الشخصي', url: res.link }]] } : undefined });
+    await notifyReveal(Object.assign({}, u, { id: userId }), '@' + (res.username || q), viaLabel, res.lines || []);
+    return;
+  }
+
+  if (q !== '/start') {
+    await safeSend(chatId, '🤔 أرسل لي <b>رقمًا</b> (مثل: +9647...) أو <b>يوزر تيليجرام</b> (مثل: @name).', { parse_mode: 'HTML' });
   }
 }
 
-async function onCallback(cb) {
-  const data = cb.data || '';
-  const userId = cb.from.id;
+let pendingProtect = {};
+
+// ============================ لوحة تحكم (Callback) ============================
+
+function adminPaneText(pane) {
+  switch (pane) {
+    case 'main':
+      return `🛠 <b>لوحة تحكم المالك</b>
+━━━━━━━━━━━━
+التحكم الكامل بالبوت من هنا.
+• 🎛️ الميزات — تفعيل/قفل الموقع، اليوزر، المنطقة
+• 👥 المستخدمون — قائمة، حظر، مميز، حذف
+• 🛡️ الحماية — الأرقام المحمية
+• ⚙️ الحصص والنجوم — الحصة، الساعات، الأسعار
+• 🔔 التنبيهات — تفعيل إشعارات المالك
+• 🧹 التنظيف — حذف غير النشطين`;
+    case 'features':
+      return `🎛️ <b>ميزات العرض</b>\n━\nاختر ما يظهر للمستخدم العادي (المميز والمالك يرون كل شيء).`;
+    case 'users':
+      return `👥 <b>المستخدمون</b> (${Object.keys(users).length})\n━\nاضغط على مستخدم لعرض بطاقته وإجراءات التحكم.`;
+    case 'protect':
+      return `🛡️ <b>الأرقام المحمية</b>: ${Object.keys(protectedNumbers).length}\n━\n• لإضافة رقم محمي من الإدارة: <code>/protectnum +9647...</code>\n• لحذفه: <code>/unprotectnum +9647...</code>\n• الأزرار أدناه تحذف الحماية مباشرة.\n• سعر حماية المستخدم لرقمه = ${config.protectPrice} ⭐ (أمر /setprotectprice).`;
+    case 'settings':
+      return `⚙️ <b>الحصص والنجوم</b>\n━\nاستخدم الأوامر التالية للإعداد:\n<code>/setlimit 5</code> — الحصة المجانية\n<code>/setquotahours 24</code> — ساعات تجدد الحصة\n<code>/setprice 2</code> — سعر البحث المميز بالنجوم\n<code>/settopup 5 3</code> — 5⭐ مقابل 3 بحوث\n<code>/setcontact @username</code> — زر تواصل`;
+    case 'notify':
+      return `🔔 <b>تنبيهات المالك</b>\n━\n• الكشف: إشعارك بأي عملية كشف معلومات.\n• دخل جديد: إشعارك عند دخول مستخدم جديد.`;
+    case 'cleanup':
+      return `🧹 <b>التنظيف</b>\n━\nيحذف المستخدمين غير النشطين منذ أكثر من <b>${config.cleanupDays} يوم</b> (غير المميزين وغير المحظورين وغير المالك).\n━\n<b>المستخدمون الآن:</b> ${Object.keys(users).length}\n<b>غير النشطين:</b> ${inactiveUserIds().length}`;
+    default:
+      return '🛠 لوحة التحكم';
+  }
+}
+
+async function onCallback(qcb) {
+  try { await bot.answerCallbackQuery(qcb.id); } catch (e) {}
+  const data = String(qcb.data || '');
+  const chatId = qcb.message ? qcb.message.chat.id : qcb.from.id;
+  const msgId = qcb.message ? qcb.message.message_id : null;
+  const fromId = String(qcb.from.id);
+  const edit = (text, kb) => {
+    if (!msgId) return;
+    const opts = { chat_id: chatId, message_id: msgId, parse_mode: 'HTML' };
+    if (kb) opts.reply_markup = kb;
+    bot.editMessageText(text, opts).catch(() => {});
+  };
+
+  if (isOwner(fromId) && data.startsWith('pane:')) {
+    const pane = data.split(':')[1];
+    edit(adminPaneText(pane), pane === 'main' ? adminMainKeyboard() : (pane === 'features' ? featuresKeyboard() : (pane === 'users' ? usersKeyboard(1) : (pane === 'protect' ? protectKeyboard() : (pane === 'settings' ? settingsKeyboard() : (pane === 'notify' ? notifyKeyboard() : cleanupKeyboard()))))));
+    return;
+  }
+  if (isOwner(fromId) && data.startsWith('usersp:')) {
+    const pg = parseInt(data.split(':')[1], 10) || 1;
+    edit(adminPaneText('users'), usersKeyboard(pg));
+    return;
+  }
+  if (isOwner(fromId) && data.startsWith('user:')) {
+    const id = data.split(':')[1];
+    edit(userCardAdmin(id), userCardKeyboard(id));
+    return;
+  }
+  if (isOwner(fromId) && data.startsWith('ban:')) {
+    const id = data.split(':')[1];
+    const rec = users[id];
+    if (rec) { rec.banned = true; saveUsers(); }
+    edit(userCardAdmin(id), userCardKeyboard(id));
+    return;
+  }
+  if (isOwner(fromId) && data.startsWith('unban:')) {
+    const id = data.split(':')[1];
+    const rec = users[id];
+    if (rec) { rec.banned = false; saveUsers(); }
+    edit(userCardAdmin(id), userCardKeyboard(id));
+    return;
+  }
+  if (isOwner(fromId) && data.startsWith('prem:')) {
+    const id = data.split(':')[1];
+    const rec = users[id];
+    if (rec) {
+      rec.premium = !rec.premium;
+      saveUsers();
+      if (rec.premium) bot.sendMessage(id, '👑 <b>تهانينا!</b> تم ترقيتك إلى مستخدم مميز 🌟\nيمكنك الآن البحث بلا حدود ورؤية كل المعلومات.').catch(() => {});
+      else bot.sendMessage(id, '📉 أُزيلت ترقيتك المميزة.').catch(() => {});
+    }
+    edit(userCardAdmin(id), userCardKeyboard(id));
+    return;
+  }
+  if (isOwner(fromId) && data.startsWith('deluser:')) {
+    const id = data.split(':')[1];
+    delete users[id];
+    saveUsers();
+    edit(adminPaneText('users'), usersKeyboard(1));
+    return;
+  }
+  if (isOwner(fromId) && data.startsWith('tog:')) {
+    const k = data.split(':')[1];
+    if (k === 'location') config.locationEnabled = !config.locationEnabled;
+    if (k === 'username') config.usernameEnabled = !config.usernameEnabled;
+    if (k === 'region') config.regionEnabled = !config.regionEnabled;
+    saveConfig();
+    edit(adminPaneText('features'), featuresKeyboard());
+    return;
+  }
+  if (isOwner(fromId) && (data === 'lock:all' || data === 'unlock:all')) {
+    config.locationEnabled = data === 'unlock:all';
+    config.usernameEnabled = data === 'unlock:all';
+    config.regionEnabled = data === 'unlock:all';
+    saveConfig();
+    edit(adminPaneText('features'), featuresKeyboard());
+    return;
+  }
+  if (isOwner(fromId) && data === 'mnt:toggle') {
+    config.maintenance = !config.maintenance;
+    saveConfig();
+    const kb = { inline_keyboard: [[{ text: (config.maintenance ? '🟢 تشغيل البوت' : '🔴 إيقاف مؤقت'), callback_data: 'mnt:toggle' }], [{ text: '🏠 رجوع', callback_data: 'pane:main' }]] };
+    edit(adminPaneText('main'), kb);
+    return;
+  }
+  if (isOwner(fromId) && data.startsWith('notify:')) {
+    const k = data.split(':')[1];
+    if (k === 'reveals') config.notifyReveals = !config.notifyReveals;
+    if (k === 'joins') config.notifyJoins = !config.notifyJoins;
+    saveConfig();
+    edit(adminPaneText('notify'), notifyKeyboard());
+    return;
+  }
+  if (isOwner(fromId) && data === 'cleanup:preview') {
+    const ids = inactiveUserIds();
+    edit((adminPaneText('cleanup')) + '\n\nالآيدي/الاسم:\n' + ids.slice(0, 8).map(i => `• <code>${i}</code> ${esc((users[i] || {}).name || '—')}`).join('\n') + (ids.length > 8 ? `\n• ... و${ids.length - 8} آخرون` : ''), cleanupKeyboard());
+    return;
+  }
+  if (isOwner(fromId) && data === 'cleanup:go') {
+    if (cleanupRunning) return;
+    cleanupRunning = true;
+    const ids = inactiveUserIds();
+    for (const id of ids) delete users[id];
+    const count = ids.length;
+    saveUsers();
+    cleanupRunning = false;
+    edit(adminPaneText('cleanup') + `\n\n✅ تم حذف <b>${count}</b> مستخدم غير نشط.`, cleanupKeyboard());
+    return;
+  }
+  if (isOwner(fromId) && data.startsWith('pdel:')) {
+    const p = data.split(':')[1];
+    delete protectedNumbers[p];
+    saveProtected();
+    edit(adminPaneText('protect'), protectKeyboard());
+    return;
+  }
+
+  if (data === 'info:terms') {
+    bot.sendMessage(chatId, TERMS_TEXT, { parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
+  if (data === 'info:account') {
+    bot.sendMessage(chatId, accountCard(fromId), { parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
+  if (data === 'info:contact') {
+    bot.sendMessage(chatId, `📞 <b>تواصل مع المالك</b>\n\n${config.contact || '—'}`, { parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
+  if (data === 'noop') return;
 
   if (data.startsWith('pay:')) {
-    const number = decodeURIComponent(data.slice(4));
-    const chatId = cb.message ? cb.message.chat.id : userId;
-    if (config.perSearchStars <= 0) {
-      await bot.answerCallbackQuery(cb.id, { text: 'ميزة الدفع معطلة حاليًا.' });
-      return;
+    const e164 = data.split(':')[1];
+    if (config.perSearchStars > 0) {
+      await sendStarInvoice(chatId, '⭐ بحث مميز', 'معلومات كاملة ومحدثة لهذا الرقم', e164, config.perSearchStars, `⭐ بحث مميز (${config.perSearchStars} ⭐)`);
     }
-    try {
-      await sendStarInvoice(chatId, number, config.perSearchStars);
-    } catch (e) {
-      console.error('فشل إرسال الفاتورة:', e.message || e);
-      await bot.answerCallbackQuery(cb.id, { text: 'تعذّر إنشاء الفاتورة، حاول مرة أخرى.' });
-      return;
+    return;
+  }
+  if (data.startsWith('payuser:')) {
+    const qq = data.split(':')[1];
+    if (config.perSearchStars > 0) {
+      await sendStarInvoice(chatId, '⭐ بحث عكسي', 'بحث عكسي عن اليوزر @' + qq.replace(/^@/, ''), 'payuser:' + qq, config.perSearchStars, `⭐ بحث عكسي (${config.perSearchStars} ⭐)`);
     }
-    await bot.answerCallbackQuery(cb.id);
     return;
   }
-
-  if (!isOwner(userId)) {
-    await bot.answerCallbackQuery(cb.id, { text: 'هذه الأزرار للإدارة فقط.' });
-    return;
-  }
-  if (!cb.message || !cb.message.chat || !cb.message.message_id) return;
-
-  if (data === 'list:premium') {
-    const ids = premiumUsers();
-    if (!ids.length) {
-      await bot.answerCallbackQuery(cb.id, { text: 'لا يوجد مميزون بعد — أرسل /premium <id>' });
-      return;
+  if (data === 'topup') {
+    if (config.topupStars > 0 && config.topupAmount > 0) {
+      await sendStarInvoice(chatId, '💎 شحن الحصة', 'إضافة ' + config.topupAmount + ' بحث إضافي إلى حصتك', 'topup', config.topupStars, `💎 شحن ${config.topupStars} ⭐`);
     }
-    const kb = {
-      inline_keyboard: ids.map((id) => [
-        { text: `❌ إزالة تمييز ${id}`, callback_data: 'unprem:' + id },
-      ]),
-    };
-    await bot.sendMessage(
-      cb.message.chat.id,
-      '⭐ <b>المستخدمون المميزون</b> (بحث غير محدود):\n' +
-      ids.map((id, i) => `${i + 1}. <code>${id}</code>`).join('\n') +
-      '\n\nلإضافة مميز جديد أرسل: <code>/premium &lt;id&gt;</code>',
-      { parse_mode: 'HTML', reply_markup: kb }
-    );
-    await bot.answerCallbackQuery(cb.id);
     return;
   }
-
-  if (data.startsWith('unprem:')) {
-    const id = data.slice(7);
-    if (users[id]) users[id].premium = false;
-    saveUsers();
-    await bot.answerCallbackQuery(cb.id, { text: 'تمت إزالة التمييز ✅' });
+  if (data.startsWith('protect:')) {
+    const e164 = data.split(':')[1];
+    if (config.protectPrice > 0) {
+      await sendStarInvoice(chatId, '🛡️ حماية رقم', 'حماية رقمك من البحث', 'protect:' + e164, config.protectPrice, `🛡️ حماية (${config.protectPrice} ⭐)`);
+    }
     return;
   }
+}
 
-  if (data === 'info:contact') {
-    await bot.answerCallbackQuery(cb.id, {
-      text: config.contact
-        ? 'مفعّل: ' + config.contact.slice(0, 40)
-        : 'معطّل — أرسل /setcontact <نص> لإضافته، أو /delcontact لحذفه',
-    });
-    return;
-  }
+// ============================ Commands ============================
 
-  if (data === 'tog:location') { config.locationEnabled = !config.locationEnabled; saveConfig(); }
-  else if (data === 'tog:username') { config.usernameEnabled = !config.usernameEnabled; saveConfig(); }
-  else if (data === 'tog:region') { config.regionEnabled = !config.regionEnabled; saveConfig(); }
-  else if (data === 'lock:all') {
-    config.locationEnabled = config.usernameEnabled = config.regionEnabled = false;
+function setupCommands(bot) {
+  const onText = (re, fn) => bot.onText(re, fn);
+
+  onText(/^\/start/, onStart);
+  onText(/^\/help/, onHelp);
+
+  onText(/^\/admin$/, (msg) => {
+    if (!isOwner(msg.from.id)) return;
+    bot.sendMessage(msg.chat.id, adminPaneText('main'), { parse_mode: 'HTML', reply_markup: adminMainKeyboard() }).catch(() => {});
+  });
+
+  onText(/^\/setlimit\s+(\d+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    config.dailyLimit = Math.max(0, parseInt(m[1], 10));
     saveConfig();
-  } else if (data === 'unlock:all') {
-    config.locationEnabled = config.usernameEnabled = config.regionEnabled = true;
+    bot.sendMessage(msg.chat.id, `✅ الحصة أصبحت <b>${config.dailyLimit}</b> بحث لكل ${config.quotaHours} ساعة.`, { parse_mode: 'HTML' }).catch(() => {});
+  });
+
+  onText(/^\/setquotahours\s+(\d+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    config.quotaHours = Math.max(1, parseInt(m[1], 10));
     saveConfig();
-  } else if (data === 'info:limit') {
-    await bot.answerCallbackQuery(cb.id, { text: 'لتغييره أرسل: /setlimit <عدد> (0 = غير محدود)' });
-    return;
-  } else if (data === 'info:stars') {
-    await bot.answerCallbackQuery(cb.id, { text: 'لتغييره أرسل: /setprice <عدد النجوم>' });
-    return;
-  } else {
-    await bot.answerCallbackQuery(cb.id);
-    return;
-  }
+    bot.sendMessage(msg.chat.id, `✅ الحصة تتجدد الآن كل <b>${config.quotaHours}</b> ساعة.`, { parse_mode: 'HTML' }).catch(() => {});
+  });
 
-  await bot.answerCallbackQuery(cb.id, { text: 'تم التحديث ✅' });
-  try {
-    await bot.editMessageReplyMarkup(
-      adminKeyboard(),
-      { chat_id: cb.message.chat.id, message_id: cb.message.message_id }
-    );
-  } catch (e) { /* تم تحديثها بالفعل */ }
-}
-
-async function onStart(msg) {
-  const text =
-    '👋 أهلاً بك في بوت <b>معلومـات الأرقـام</b>\n' +
-    '━━━━━━━━━━━━━\n' +
-    'أرسل لي رقم هاتف بالصيغة <b>الدولية</b> مثل:\n' +
-    '<code>+201012345678</code>\n\n' +
-    'سأعرض لك:\n' +
-    '• 🌍 الدولة والمنطقة / المدينة\n' +
-    '• 📶 المشغّل ومقدّم الخدمة\n' +
-    '• 📱 نوع الخط (جوال / أرضي / ...)\n' +
-    '• ⏰ المنطقة الزمنية\n' +
-    '• 🗺️ موقعه التقريبي على الخريطة\n' +
-    '• 🤖 إذا كان الرقم مسجلاً في تيليجرام سأعرض يوزر الحساب\n\n' +
-    '⚠️ <i>الموقع تقريبي ويعتمد على الدولة/المنطقة فقط، وليس موقع الشخص الفعلي.</i>';
-  await bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML', reply_markup: mainKeyboard() });
-}
-
-async function onAdmin(msg) {
-  await bot.sendMessage(
-    msg.chat.id,
-    '🛠 <b>لوحة تحكم الإدارة</b>\n\n' +
-    'اضغط على زر لفتح/قفل ميزة، أو استخدم الأوامر:\n' +
-    '• <code>/setlimit 3</code> — الحصة اليومية للجميع (0 = غير محدود)\n' +
-    '• <code>/setlimit &lt;معرّف المستخدم&gt; 5</code> — حصة لمستخدم معين\n' +
-    '• <code>/premium &lt;معرّف المستخدم&gt;</code> — رفع/إزالة مميز (بحث بلا حدود)\n' +
-    '• <code>/lookup @يوزر</code> أو <code>/lookup &lt;آيدي&gt;</code> — جلب معلومات مستخدم\n' +
-    '• <code>/setcontact نص</code> / <code>/delcontact</code> — إظهار/حذف زر التواصل السفلي\n' +
-    '• <code>/setprice 2</code> — سعر البحث الكامل بالنجوم (0 = تعطيل الدفع)\n' +
-    '• <code>/stats</code> — إحصائيات',
-    { parse_mode: 'HTML', reply_markup: adminKeyboard() }
-  );
-}
-
-async function onSetLimit(msg, arg) {
-  const chatId = msg.chat.id;
-  if (!arg) {
-    await bot.sendMessage(chatId,
-      'الاستخدام:\n<code>/setlimit 3</code> — لكل المستخدمين (0 = غير محدود)\n<code>/setlimit &lt;معرّف&gt; 5</code> — لمستخدم معين',
-      { parse_mode: 'HTML' });
-    return;
-  }
-  const parts = arg.trim().split(/\s+/);
-  const isNum = (s) => /^\d+$/.test(s);
-  if (parts.length === 2 && isNum(parts[0]) && isNum(parts[1]) && Number(parts[1]) <= 1000000) {
-    const n = Number(parts[1]);
-    const u = getUser(parts[0]);
-    u.limit = n;
-    saveUsers();
-    await bot.sendMessage(chatId,
-      `✅ حصة المستخدم <code>${parts[0]}</code>: ${n === 0 ? 'غير محدودة' : n + ' بحث/يوم'}`,
-      { parse_mode: 'HTML' });
-  } else if (parts.length === 1 && isNum(parts[0]) && Number(parts[0]) <= 1000000) {
-    const n = Number(parts[0]);
-    config.dailyLimit = n;
+  onText(/^\/setprice\s+(\d+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    config.perSearchStars = Math.max(0, parseInt(m[1], 10));
     saveConfig();
-    await bot.sendMessage(chatId,
-      `✅ الحصة اليومية للجميع: ${n === 0 ? 'غير محدودة' : n + ' بحث/يوم'}`,
-      { parse_mode: 'HTML' });
-  } else {
-    await bot.sendMessage(chatId, '❌ صيغة غير صحيحة.', { parse_mode: 'HTML' });
-  }
-}
+    bot.sendMessage(msg.chat.id, `✅ سعر البحث المميز: <b>${config.perSearchStars} ⭐</b>.`, { parse_mode: 'HTML' }).catch(() => {});
+  });
 
-async function onSetPrice(msg, arg) {
-  const chatId = msg.chat.id;
-  if (!arg || !/^\d+$/.test(arg.trim())) {
-    await bot.sendMessage(chatId, 'الاستخدام: <code>/setprice 2</code> — عدد النجوم للبحث الكامل (0 = تعطيل الدفع)', { parse_mode: 'HTML' });
-    return;
-  }
-  const n = Number(arg.trim());
-  config.perSearchStars = n;
-  saveConfig();
-  await bot.sendMessage(chatId, `✅ سعر البحث الكامل: ${n === 0 ? 'معطل' : n + ' ⭐ في المرة'}`);
-}
+  onText(/^\/settopup\s+(\d+)\s+(\d+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    config.topupStars = Math.max(0, parseInt(m[1], 10));
+    config.topupAmount = Math.max(1, parseInt(m[2], 10));
+    saveConfig();
+    bot.sendMessage(msg.chat.id, `✅ الشحن: <b>${config.topupStars} ⭐</b> = <b>${config.topupAmount}</b> بحث إضافي (الحصة تتجدد بعد كل ${config.quotaHours} ساعة).`, { parse_mode: 'HTML' }).catch(() => {});
+  });
 
-async function onPremium(msg, arg) {
-  const chatId = msg.chat.id;
-  if (!arg || !arg.trim()) {
-    const ids = premiumUsers();
-    if (!ids.length) {
-      await bot.sendMessage(chatId,
-        'لا يوجد مستخدمون مميزون حاليًا.\nالاستخدام:\n<code>/premium &lt;انيد المستخدم&gt;</code> — رفع / إزالة مميز',
-        { parse_mode: 'HTML' });
-      return;
-    }
-    await bot.sendMessage(chatId,
-      '⭐ <b>المستخدمون المميزون:</b>\n' +
-      ids.map((id, i) => `${i + 1}. <code>${id}</code>`).join('\n'),
-      { parse_mode: 'HTML' });
-    return;
-  }
-  const id = arg.trim().replace(/[^\d]/g, '');
-  if (!id) {
-    await bot.sendMessage(chatId, '❌ آيدي غير صالح.', { parse_mode: 'HTML' });
-    return;
-  }
-  const u = getUser(id);
-  u.premium = !u.premium;
-  saveUsers();
-  await bot.sendMessage(chatId,
-    `✅ المستخدم <code>${id}</code>: ${u.premium ? 'أصبح مميزًا (بحث بلا حدود)' : 'أُزيلت ميزة التمييز'}.`,
-    { parse_mode: 'HTML' });
-}
+  onText(/^\/setprotectprice\s+(\d+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    config.protectPrice = Math.max(0, parseInt(m[1], 10));
+    saveConfig();
+    bot.sendMessage(msg.chat.id, `✅ سعر حماية رقم المستخدم: <b>${config.protectPrice} ⭐</b>.`, { parse_mode: 'HTML' }).catch(() => {});
+  });
 
-async function resolveUserInfo(raw) {
-  const client = await getTgClient();
-  if (!client) {
-    return '✋ جلسة تيليجرام غير مفعّلة.\nضع <code>TELEGRAM_API_ID</code> و <code>TELEGRAM_API_HASH</code> في .env وشغّل <code>npm run setup</code> ثم أعد التشغيل.';
-  }
-  const t = require('telegram');
-  const input = (raw || '').trim();
-  try {
-    let entity;
-    if (/^\d+$/.test(input)) {
-      entity = await client.getEntity(input);
+  onText(/^\/setcontact\s+(.+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    config.contact = m[1].trim();
+    saveConfig();
+    bot.sendMessage(msg.chat.id, '✅ تم تعيين زر التواصل: ' + esc(config.contact), { parse_mode: 'HTML' }).catch(() => {});
+  });
+
+  onText(/^\/delcontact$/, (msg) => {
+    if (!isOwner(msg.from.id)) return;
+    config.contact = '';
+    saveConfig();
+    bot.sendMessage(msg.chat.id, '✅ تم حذف زر التواصل.').catch(() => {});
+  });
+
+  onText(/^\/protectnum\s+(.+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    let e164;
+    try { e164 = cleanNumber(m[1]); } catch (e) { bot.sendMessage(msg.chat.id, '⚠️ رقم غير صالح.').catch(() => {}); return; }
+    protectedNumbers[e164] = { by: 'owner:' + msg.from.id, at: Date.now() };
+    saveProtected();
+    bot.sendMessage(msg.chat.id, `✅ تمت حماية الرقم <code>${esc(e164)}</code> من البحث.`, { parse_mode: 'HTML' }).catch(() => {});
+  });
+
+  onText(/^\/unprotectnum\s+(.+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    let e164;
+    try { e164 = cleanNumber(m[1]); } catch (e) { bot.sendMessage(msg.chat.id, '⚠️ رقم غير صالح.').catch(() => {}); return; }
+    if (protectedNumbers[e164]) { delete protectedNumbers[e164]; saveProtected(); bot.sendMessage(msg.chat.id, '✅ تم فك الحماية عن الرقم.').catch(() => {}); }
+    else bot.sendMessage(msg.chat.id, 'هذا الرقم غير محمي.').catch(() => {});
+  });
+
+  onText(/^\/protect$/, (msg) => {
+    const u = getUser(msg.from.id);
+    if (isBanned(msg.from.id)) return;
+    if (isPremiumUser(msg.from.id)) {
+      bot.sendMessage(msg.chat.id, '🛡️ أرسل الرقم الذي تريد حمايته بالصيغة الدولية (+9647...)').catch(() => {});
     } else {
-      const uname = input.startsWith('@') ? input.slice(1) : input;
-      entity = await client.getEntity(uname);
+      bot.sendMessage(msg.chat.id, config.protectPrice > 0
+        ? `🛡️ <b>حماية الرقم</b>\nأرسل الرقم المراد حمايته بالصيغة الدولية، وسيتم خصم <b>${config.protectPrice} ⭐</b> عند تأكيد الدفع.`
+        : '🛡️ أرسل الرقم المراد حمايته بالصيغة الدولية (+9647...)').catch(() => {});
     }
-    if (!entity) throw new Error('لا يوجد مستخدم');
-    const full = await client.invoke(new t.Api.users.GetFullUser({ id: entity }));
-    const u = full.users[0];
-    const info = full.full_user || {};
-    const lines = ['🧾 <b>معلومات المستخدم</b>', '━━━━━━━━━━━━━'];
-    lines.push(`🆔 <b>الآيدي:</b> <code>${String(u.id)}</code>`);
-    if (u.username) lines.push(`🔗 <b>اليوزر:</b> <code>@${esc(u.username)}</code>`);
-    const name = [u.firstName, u.lastName].filter(Boolean).join(' ');
-    if (name) lines.push(`✏️ <b>الاسم:</b> ${esc(name)}`);
-    if (u.phone) lines.push(`📞 <b>الهاتف (إن كان ظاهرًا):</b> <code>+${esc(u.phone)}</code>`);
-    if (info.about) lines.push(`📝 <b>النّبذة / البايو:</b> ${esc(info.about)}`);
-    const st = statusAr(u.status);
-    if (st) lines.push(`🕒 <b>الحالة:</b> ${esc(st)}`);
-    if (info.common_chats_count != null) lines.push(`👥 <b>الشاتات المشتركة:</b> ${info.common_chats_count}`);
-    return lines.join('\n');
-  } catch (e) {
-    console.error('فشل /lookup:', e.message || e);
-    return `❌ تعذّر إيجاد المستخدم: <code>${esc(input)}</code>\nتأكد من صحة اليوزر أو أن الآيدي ظاهر للجلسة. (${esc(e.message || e)})`;
-  }
+    pendingProtect[String(msg.from.id)] = true;
+  });
+
+  onText(/^\/stats$/, (msg) => {
+    if (!isOwner(msg.from.id)) return;
+    const pCount = premiumUsers().length;
+    const inactiveCount = inactiveUserIds().length;
+    const total = Object.keys(users).length;
+    const text = `📊 <b>الإحصائيات</b>
+━━━━━━━━━━━━
+👥 <b>المستخدمون:</b> ${total}
+🟢 <b>نشط:</b> ${Math.max(0, total - inactiveCount - premiumUsers().length)}
+👑 <b>مميز:</b> ${pCount}
+⚪ <b>غير نشط:</b> ${inactiveCount}
+🛡️ <b>محمي:</b> ${Object.keys(protectedNumbers).length}
+💾 <b>التخزين:</b> ${DATA_DIR}`;
+    bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' }).catch(() => {});
+  });
+
+  onText(/^\/cleanup$/, async (msg) => {
+    if (!isOwner(msg.from.id)) return;
+    if (cleanupRunning) return;
+    cleanupRunning = true;
+    const ids = inactiveUserIds();
+    for (const id of ids) delete users[id];
+    const count = ids.length;
+    saveUsers();
+    cleanupRunning = false;
+    bot.sendMessage(msg.chat.id, `🧹 تم حذف <b>${count}</b> مستخدم غير نشط.`).catch(() => {});
+  });
+
+  onText(/^\/premium\s+(.+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    const tid = parseInt(String(m[1]).replace(/[^\d]/g, ''), 10);
+    if (!tid || !users[String(tid)]) { bot.sendMessage(msg.chat.id, '⚠️ لم أجد هذا المستخدم في القاعدة.').catch(() => {}); return; }
+    const rec = users[String(tid)];
+    rec.premium = true;
+    saveUsers();
+    bot.sendMessage(String(tid), '👑 <b>تهانينا!</b> تمت ترقيتك إلى المستخدمين المميزين 🌟\nالآن يمكنك البحث <b>بلا حدود</b> ورؤية كل المعلومات.').catch(() => {});
+    bot.sendMessage(msg.chat.id, `✅ تم رفع <code>${tid}</code> إلى مميز.`, { parse_mode: 'HTML' }).catch(() => {});
+  });
+
+  onText(/^\/unpremium\s+(.+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    const tid = parseInt(String(m[1]).replace(/[^\d]/g, ''), 10);
+    if (!tid || !users[String(tid)]) { bot.sendMessage(msg.chat.id, '⚠️ لم أجد هذا المستخدم.').catch(() => {}); return; }
+    users[String(tid)].premium = false;
+    saveUsers();
+    bot.sendMessage(String(tid), '📉 تم إزالة ترقيتك المميزة.').catch(() => {});
+    bot.sendMessage(msg.chat.id, `✅ تم إزالة مميزية <code>${tid}</code>.`, { parse_mode: 'HTML' }).catch(() => {});
+  });
+
+  onText(/^\/ban\s+(.+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    const tid = parseInt(String(m[1]).replace(/[^\d]/g, ''), 10);
+    if (!tid || !users[String(tid)]) { bot.sendMessage(msg.chat.id, '⚠️ لم أجد هذا المستخدم.').catch(() => {}); return; }
+    users[String(tid)].banned = true;
+    saveUsers();
+    bot.sendMessage(msg.chat.id, `🚫 تم حظر <code>${tid}</code>.`, { parse_mode: 'HTML' }).catch(() => {});
+  });
+
+  onText(/^\/unban\s+(.+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    const tid = parseInt(String(m[1]).replace(/[^\d]/g, ''), 10);
+    if (!tid || !users[String(tid)]) { bot.sendMessage(msg.chat.id, '⚠️ لم أجد هذا المستخدم.').catch(() => {}); return; }
+    users[String(tid)].banned = false;
+    saveUsers();
+    bot.sendMessage(msg.chat.id, `🔓 تم فك الحظر عن <code>${tid}</code>.`, { parse_mode: 'HTML' }).catch(() => {});
+  });
+
+  onText(/^\/lookup\s+(.+)$/, async (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    const raw = m[1].trim();
+    let targetId = null;
+    if (/^\d{5,12}$/.test(raw)) targetId = raw;
+    else if (/^@?[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(raw)) targetId = '@' + raw.replace(/^@/, '');
+    else { bot.sendMessage(msg.chat.id, '⚠️ أرسل آيدي أو يوزر.').catch(() => {}); return; }
+
+    let res = null;
+    if (targetId.startsWith('@')) {
+      const lk = await usernameLookup(targetId);
+      if (lk.ok) {
+        await safeSend(msg.chat.id, lk.text, { parse_mode: 'HTML', reply_markup: lk.link ? { inline_keyboard: [[{ text: '👤 فتح الملف الشخصي', url: lk.link }]] } : undefined });
+        return;
+      }
+      bot.sendMessage(msg.chat.id, '⚠️ لم أجد هذا اليوزر (أو الجلسة غير متاحة).').catch(() => {});
+      return;
+    }
+    const tgi = await tgAccountInfo('+' + targetId);
+    bot.sendMessage(msg.chat.id, `🔎 <b>بحث المدير</b>\n${tgi}`, { parse_mode: 'HTML' }).catch(() => {});
+  });
+
+  onText(/^\/listpremium$/, (msg) => {
+    if (!isOwner(msg.from.id)) return;
+    const list = premiumUsers();
+    bot.sendMessage(msg.chat.id, list.length ? '👑 <b>المميزون:</b>\n' + list.map(id => `• <code>${id}</code> ${esc(users[id]?.name || '')}`).join('\n') : 'لا يوجد مميزون حاليًا.', { parse_mode: 'HTML' }).catch(() => {});
+  });
+
+  onText(/^\/setcleanup\s+(\d+)$/, (msg, m) => {
+    if (!isOwner(msg.from.id)) return;
+    config.cleanupDays = Math.max(1, parseInt(m[1], 10));
+    saveConfig();
+    bot.sendMessage(msg.chat.id, `✅ تنظيف غير النشطين بعد <b>${config.cleanupDays}</b> يوم.`).catch(() => {});
+  });
 }
 
-async function onLookup(msg, arg) {
-  const chatId = msg.chat.id;
-  if (!arg || !arg.trim()) {
-    await bot.sendMessage(chatId,
-      'الاستخدام:\n<code>/lookup @username</code> — معلومات مستخدم باليوزر\n<code>/lookup 123456789</code> — بالآيدي',
-      { parse_mode: 'HTML' });
-    return;
-  }
-  const text = await resolveUserInfo(arg);
-  await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
-}
+// ============================ البوت ============================
 
-async function onSetContact(msg, arg) {
-  const chatId = msg.chat.id;
-  if (!arg || !arg.trim()) {
-    await bot.sendMessage(chatId,
-      'الاستخدام:\n<code>/setcontact اسمك - @يوزرك - قناتك</code> — يُظهر زر "📞 تواصل مع المالك"\n<code>/delcontact</code> — حذف الزر نهائيًا',
-      { parse_mode: 'HTML' });
-    return;
-  }
-  config.contact = arg.trim();
-  saveConfig();
-  await bot.sendMessage(chatId,
-    '✅ تم حفظ معلومات التواصل.\nسيظهر زر <b>"📞 تواصل مع المالك"</b> أسفل حقل الكتابة.',
-    { parse_mode: 'HTML', reply_markup: mainKeyboard() });
-}
+let bot = null;
 
-async function onDelContact(msg) {
-  config.contact = '';
-  saveConfig();
-  await bot.sendMessage(msg.chat.id, '✅ تم حذف زر التواصل نهائيًا.', { parse_mode: 'HTML' });
-}
+function startBot() {
+  bot = new TelegramBot(BOT_TOKEN, { polling: true, onlyFirstMatch: true });
+  setupCommands(bot);
 
-async function onStats(msg) {
-  const today = todayKey();
-  let todaySearches = 0;
-  let total = 0;
-  let paidStars = 0;
-  for (const k of Object.keys(users)) {
-    const u = users[k];
-    if (u.date === today) todaySearches += u.used || 0;
-    total += u.total || 0;
-    paidStars += u.paid || 0;
-  }
-  await bot.sendMessage(
-    msg.chat.id,
-    '📊 <b>إحصائيات البوت</b>\n' +
-    '━━━━━━━━━━━━━\n' +
-    `👥 المستخدمون: <b>${Object.keys(users).length}</b>\n` +
-    `📈 عمليات بحث اليوم: <b>${todaySearches}</b>\n` +
-    `📚 إجمالي العمليات: <b>${total}</b>\n` +
-    `⭐ نجوم مدفوعة: <b>${paidStars}</b>`,
-    { parse_mode: 'HTML' }
-  );
-}
-
-module.exports = { analyzeNumber, cleanNumber, regionFlag, lookupCarrier, buildOutput };
-
-// ===================== التشغيل =====================
-if (require.main === module) {
-  if (!BOT_TOKEN) {
-    console.error('✋ ضع BOT_TOKEN في ملف .env ثم أعد التشغيل.');
-    process.exit(1);
-  }
-
-  const TelegramBot = require('node-telegram-bot-api');
-  bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-  bot.onText(/^\/(start|help)(@\w+)?/, onStart);
-  bot.onText(/^\/admin(@\w+)?$/, async (msg) => {
-    if (!isOwner(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '⛔ هذا الأمر للإدارة فقط.');
-      return;
-    }
-    await onAdmin(msg);
-  });
-  bot.onText(/^\/setlimit(@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
-    if (!isOwner(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '⛔ هذا الأمر للإدارة فقط.');
-      return;
-    }
-    await onSetLimit(msg, match[2]);
-  });
-  bot.onText(/^\/setprice(@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
-    if (!isOwner(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '⛔ هذا الأمر للإدارة فقط.');
-      return;
-    }
-    await onSetPrice(msg, match[2]);
-  });
-  bot.onText(/^\/premium(@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
-    if (!isOwner(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '⛔ هذا الأمر للإدارة فقط.');
-      return;
-    }
-    await onPremium(msg, match[2]);
-  });
-  bot.onText(/^\/lookup(@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
-    if (!isOwner(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '⛔ هذا الأمر للإدارة فقط.');
-      return;
-    }
-    await onLookup(msg, match[2]);
-  });
-  bot.onText(/^\/setcontact(@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
-    if (!isOwner(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '⛔ هذا الأمر للإدارة فقط.');
-      return;
-    }
-    await onSetContact(msg, match[2]);
-  });
-  bot.onText(/^\/delcontact(@\w+)?$/, async (msg) => {
-    if (!isOwner(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '⛔ هذا الأمر للإدارة فقط.');
-      return;
-    }
-    await onDelContact(msg);
-  });
-  bot.onText(/^\/stats(@\w+)?$/, async (msg) => {
-    if (!isOwner(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '⛔ هذا الأمر للإدارة فقط.');
-      return;
-    }
-    await onStats(msg);
+  bot.on('message', (msg) => {
+    if (msg.text && msg.text.startsWith('/')) return;
+    onMessage(msg);
   });
 
-  bot.on('callback_query', (cb) => onCallback(cb).catch((e) => console.error('خطأ في الأزرار:', e.message || e)));
-  bot.on('pre_checkout_query', (q) => bot.answerPreCheckoutQuery(q.id, true).catch(() => {}));
+  bot.on('callback_query', (qcb) => { onCallback(qcb); });
+
+  bot.on('pre_checkout_query', (query) => {
+    bot.answerPreCheckoutQuery(query.id, true).catch(() => {});
+  });
 
   bot.on('successful_payment', async (msg) => {
-    try {
-      const userId = msg.from.id;
-      const number = msg.successful_payment.invoice_payload || '';
-      const stars = msg.successful_payment.total_amount || 0;
-      const u = getUser(userId);
-      u.paid = (u.paid || 0) + stars;
+    const from = msg.from.id;
+    const payload = String(msg.successful_payment.invoice_payload || '');
+    const amount = msg.successful_payment.total_amount;
+    if (payload.startsWith('protect:')) {
+      const e164 = payload.split(':')[1];
+      protectedNumbers[e164] = { by: from, at: Date.now() };
+      saveProtected();
+      const u = getUser(from);
+      u.paid = (u.paid || 0) + amount;
       saveUsers();
-      const r = await analyzeNumber(number);
-      if (r.ok) {
-        await renderResult(msg.chat.id, r, { paid: true });
+      await safeSend(from, `✅ <b>تمت حماية رقمك</b> <code>${esc(e164)}</code> 🛡️\nلن يظهر منه أي شيء بعد اليوم.`, { parse_mode: 'HTML' });
+      await notifyOwner(`🛡️ <b>تم شراء حماية رقم</b>\n👤 المستخدم: <code>${from}</code>\n📱 الرقم: <code>${esc(e164)}</code>\n⭐ النجوم: ${amount}\n🕒 ${new Date().toLocaleString('ar-EG', { hour12: false })}`, { parse_mode: 'HTML' });
+      return;
+    }
+    if (payload === 'topup') {
+      const u = getUser(from);
+      u.topup = (u.topup || 0) + (config.topupAmount || 1);
+      u.paid = (u.paid || 0) + amount;
+      saveUsers();
+      const q = quotaInfo(u);
+      await safeSend(from, `💎 <b>تم شحن حصتك!</b>\nأصبح لديك الآن <b>${q.left}</b> بحث متاح.\n🔁 تعود الحصة تلقائيًا بعد ${q.hours}س ${q.minutes}د.`, { parse_mode: 'HTML' });
+      await notifyOwner(`💎 <b>شحن حصة</b>\n👤 المستخدم: <code>${from}</code>\n⭐ النجوم: ${amount}\n🔎 أضيف: ${config.topupAmount} بحث\n🕒 ${new Date().toLocaleString('ar-EG', { hour12: false })}`, { parse_mode: 'HTML' });
+      return;
+    }
+    if (payload.startsWith('payuser:')) {
+      const qq = payload.split(':')[1];
+      const u = getUser(from);
+      u.paid = (u.paid || 0) + amount;
+      saveUsers();
+      const res = await usernameLookup(qq);
+      if (res.ok) {
+        await safeSend(from, res.text, { parse_mode: 'HTML', reply_markup: res.link ? { inline_keyboard: [[{ text: '👤 فتح الملف الشخصي', url: res.link }]] } : undefined });
+        await notifyReveal(Object.assign({}, u, { id: from }), '@' + (res.username || qq), '⭐ نجوم', res.lines || []);
       } else {
-        await bot.sendMessage(msg.chat.id, '❌ تعذّر معالجة الرقم بعد الدفع. أرسل الرقم مرة أخرى.', { parse_mode: 'HTML' });
+        await safeSend(from, '⚠️ لم أجد هذا اليوزر.', { parse_mode: 'HTML' });
       }
-    } catch (e) {
-      console.error('خطأ في الدفع:', e.message || e);
+      return;
+    }
+    const e164 = payload;
+    if (e164 && /^\+?\d/.test(e164)) {
+      const u = getUser(from);
+      u.paid = (u.paid || 0) + amount;
+      saveUsers();
+      const isP = protectedNumbers[e164] || protectedNumbers[e164.replace(/^\+/, '')];
+      if (isP) {
+        await safeSend(from, '🔒 هذا الرقم محمي ولا يمكن عرضه.', { parse_mode: 'HTML' });
+        return;
+      }
+      await performNumberSearch(from, e164, { paid: true, via: 'paid', userId: from });
+      return;
     }
   });
 
-  bot.on('polling_error', (e) => console.error('polling_error:', e.message || e));
+  bot.on('polling_error', (err) => { console.error('⚠️ polling_error: ' + (err && err.message)); });
 
-  bot.on('message', (msg) => onMessage(msg).catch((e) => console.error('خطأ في المعالجة:', e.message || e)));
+  console.log('🤖 البوت يعمل الآن (polling).');
 
-  const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('number-info-bot is running');
-  });
-  server.listen(PORT, () => console.log(`🌐 خادم الـ HTTP يعمل على المنفذ ${PORT}`));
-
-  // ===== حماية الاستمرار 24/7: لا يموت البوت من خطأ عابر =====
-  process.on('unhandledRejection', (err) => console.error('unhandledRejection:', err && (err.message || err)));
-  process.on('uncaughtException', (err) => console.error('uncaughtException:', err && (err.message || err)));
-  ['SIGTERM', 'SIGINT'].forEach((sig) =>
-    process.on(sig, () => {
-      console.log('🛑 إيقاف نظيف...');
-      try { if (bot) bot.stopPolling(); } catch (e) { /* */ }
-      process.exit(0);
-    })
-  );
-
-  // نبض دوري خفيف يبقي العملية نشطة على المنصات المجانية
-  setInterval(() => { /* no-op keep-alive */ }, 60 * 1000).unref();
-
-  console.log('🚀 البوت يعمل الآن...');
-  console.log(`📂 مجلد البيانات: ${DATA_DIR}`);
-  if (OWNER_ID) console.log(`🔑 المالك مفعّل: ${OWNER_ID}`);
-  else console.log('⚠️ لم يتم ضبط OWNER_ID — أوامر الإدارة معطلة.');
-  if (config.perSearchStars > 0) console.log(`⭐ دفع النجوم مفعل: ${config.perSearchStars} ⭐ للبحث الكامل.`);
+  setInterval(() => {
+    try { bot.getMe().catch(() => {}); } catch (e) {}
+  }, 60000);
 }
+
+function stopBot() {
+  if (bot) { try { bot.stopPolling(); } catch (e) {} }
+}
+
+// ============================ خادم الصحة ============================
+
+if (require.main === module) {
+  http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, uptime: Math.floor(process.uptime()), users: Object.keys(users).length }));
+  }).listen(PORT, () => {
+    console.log(`✅ HTTP server على المنفذ ${PORT}`);
+  });
+}
+
+// ============================ الاستقرار 24/7 ============================
+
+process.on('unhandledRejection', (err) => {
+  console.error('⚠️ unhandledRejection: ' + (err && err.message));
+});
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ uncaughtException: ' + (err && err.stack));
+});
+process.on('SIGTERM', () => { console.log('▪️ إيقاف SIGTERM'); stopBot(); process.exit(0); });
+process.on('SIGINT', () => { console.log('▪️ إيقاف SIGINT'); stopBot(); process.exit(0); });
+
+if (require.main === module) {
+  startBot();
+}
+
+module.exports = { analyzeNumber, cleanNumber, regionFlag, lookupCarrier, buildOutput, getUser, isPremiumUser, premiumUsers, config };
