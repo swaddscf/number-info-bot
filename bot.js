@@ -587,30 +587,45 @@ async function sendStarInvoice(chatId, title, desc, payload, stars, labelText) {
 
 // ============================ البحث ============================
 
-async function usernameLookup(q) {
-  const qq = String(q).replace(/^@/, '').trim();
-  if (!qq) return { ok: false };
+async function resolveUserCard(q) {
+  const query = String(q).trim().replace(/^@/, '');
+  if (!query) return { ok: false, error: 'empty' };
   const st = await getTgClient();
   if (!st) return { ok: false, error: 'nosession' };
   try {
     const { Api } = require('telegram');
-    const res = await st.invoke(new Api.contacts.ResolveUsername({ username: qq }));
-    if (!res || !res.users || !res.users.length) return { ok: false };
-    const u = res.users[0];
-    const rawPhone = u.phone ? '+' + String(u.phone).replace(/^\+/, '') : null;
+    let entity;
+    if (/^\d{6,14}$/.test(query)) {
+      entity = await st.getEntity(query);
+    } else {
+      const res = await st.invoke(new Api.contacts.ResolveUsername({ username: query }));
+      if (!res || !res.users || !res.users.length) return { ok: false, error: 'notfound' };
+      entity = res.users[0];
+    }
+    let u = entity;
+    let fullUser = null;
+    try {
+      const full = await st.invoke(new Api.users.GetFullUser({ id: entity }));
+      if (full && full.users && full.users[0]) u = full.users[0];
+      if (full && full.full_user) fullUser = full.full_user;
+    } catch (e) {}
+    const rawPhone = u && u.phone ? '+' + String(u.phone).replace(/^\+/, '') : null;
     const name = [u.firstName, u.lastName].filter(Boolean).join(' ') || u.username || u.id;
     const lines = [];
-    lines.push('🕵️ <b>نتيجة البحث باليوزر</b>');
+    lines.push('🕵️ <b>نتيجة البحث</b>');
     lines.push('━'.repeat(10));
     lines.push(`👤 <b>الاسم:</b> ${esc(name)}`);
     if (u.username) lines.push(`🔗 <b>اليوزر:</b> @${esc(u.username)}`);
     lines.push(`🆔 <b>الآيدي:</b> <code>${u.id}</code>`);
+    if (fullUser && fullUser.about) lines.push(`📝 <b>النبذة:</b> ${esc(String(fullUser.about).slice(0, 120))}`);
+    if (fullUser && fullUser.common_chats_count > 0) lines.push(`👥 <b>مجموعات مشتركة:</b> ${fullUser.common_chats_count}`);
+    if (u.bot) lines.push('🤖 <b>النوع:</b> بوت');
+    if (u.restricted) lines.push('🚫 <b>الحالة:</b> مقيد');
     if (rawPhone) {
       const isP = protectedNumbers[rawPhone] || protectedNumbers[rawPhone.slice(1)] || protectedNumbers[rawPhone.replace(/^\+/, '')];
       if (isP) lines.push('📱 <b>الرقم:</b> 🔒 محمي من قبل صاحبه');
       else lines.push(`📱 <b>الرقم:</b> <span class="tg-spoiler">${esc(rawPhone)}</span>`);
     }
-    if (u.restricted) lines.push('🚫 <b>الحالة:</b> مستخدم مقيد');
     return {
       ok: true,
       name,
@@ -622,7 +637,8 @@ async function usernameLookup(q) {
       lines,
     };
   } catch (e) {
-    return { ok: false };
+    const msg = (e && (e.errorMessage || e.message)) || 'failed';
+    return { ok: false, error: String(msg).slice(0, 120) };
   }
 }
 
@@ -754,7 +770,7 @@ async function onMessage(msg) {
       return;
     }
     if (looksLikeUsername(q)) {
-      const res = await usernameLookup(q);
+      const res = await resolveUserCard(q);
       if (res.ok) {
         await safeSend(chatId, res.text, { parse_mode: 'HTML', reply_markup: res.link ? { inline_keyboard: [[{ text: '👤 فتح الملف الشخصي', url: res.link }]] } : undefined });
       } else {
@@ -810,6 +826,43 @@ async function onMessage(msg) {
       await safeSend(chatId, '🔒 <b>هذا الرقم محمي من قبل صاحبه</b>\nلا يمكن عرض معلوماته في هذا البوت. شكرًا لتفهمك 🛡️', { parse_mode: 'HTML' });
       return;
     }
+
+    let validPhone = true;
+    try { analyzeNumber(e164); } catch (err) { validPhone = false; }
+
+    if (!validPhone) {
+      const stripped = String(q).trim();
+      if (/^\d{6,14}$/.test(stripped)) {
+        const isPremium = isPremiumUser(userId);
+        if (!isPremium && quotaFor(u) <= 0) {
+          const qinfo = quotaInfo(u);
+          let text = `⛔ <b>انتهت حصتك المجانية</b> 💤\n━\n🔁 تجدد تلقائيًا بعد ${qinfo.hours}س ${qinfo.minutes}د (الساعة ${qinfo.at}).\n━`;
+          const kb = { inline_keyboard: [] };
+          if (config.topupStars > 0 && config.topupAmount > 0) {
+            kb.inline_keyboard.push([{ text: `💎 اشحن (${config.topupStars} ⭐ = ${config.topupAmount} بحث)`, callback_data: 'topup' }]);
+          }
+          await safeSend(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
+          return;
+        }
+        const via = isPremium ? 'premium' : 'normal';
+        consumeQuota(u);
+        const res = await resolveUserCard(stripped);
+        if (!res.ok) {
+          u.used = Math.max(0, (u.used || 0) - 1);
+          saveUsers();
+          const why = res.error === 'nosession' ? 'الجلسة غير متاحة، تواصل مع المالك.' : (res.error === 'notfound' ? 'لم أجد هذا المستخدم.' : 'لا يمكن الوصول لهذا المستخدم (يجب أن يكون من جهات الاتصال أو في مجموعة مشتركة مع حساب البحث).');
+          await safeSend(chatId, '⚠️ <b>' + why + '</b>', { parse_mode: 'HTML' });
+          return;
+        }
+        const viaLabel = via === 'premium' ? '👑 مميز' : '📊 الحصة';
+        await safeSend(chatId, res.text, { parse_mode: 'HTML', reply_markup: res.link ? { inline_keyboard: [[{ text: '👤 فتح الملف الشخصي', url: res.link }]] } : undefined });
+        await notifyReveal(Object.assign({}, u, { id: userId }), '🆔 آيدي ' + res.id, viaLabel, res.lines || []);
+        return;
+      }
+      await safeSend(chatId, '⚠️ <b>رقم غير صالح</b> — أرسل رقمًا صحيحًا بالصيغة الدولية (مثال: +9647...).', { parse_mode: 'HTML' });
+      return;
+    }
+
     const isPremium = isPremiumUser(userId);
     if (!isPremium && quotaFor(u) <= 0) {
       const qinfo = quotaInfo(u);
@@ -849,7 +902,7 @@ async function onMessage(msg) {
     }
     const via = isPremium ? 'premium' : 'normal';
     consumeQuota(u);
-    const res = await usernameLookup(q);
+    const res = await resolveUserCard(q);
     if (!res.ok) {
       u.used = Math.max(0, (u.used || 0) - 1);
       saveUsers();
@@ -1224,23 +1277,17 @@ function setupCommands(bot) {
   onText(/^\/lookup\s+(.+)$/, async (msg, m) => {
     if (!isOwner(msg.from.id)) return;
     const raw = m[1].trim();
-    let targetId = null;
-    if (/^\d{5,12}$/.test(raw)) targetId = raw;
-    else if (/^@?[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(raw)) targetId = '@' + raw.replace(/^@/, '');
-    else { bot.sendMessage(msg.chat.id, '⚠️ أرسل آيدي أو يوزر.').catch(() => {}); return; }
-
-    let res = null;
-    if (targetId.startsWith('@')) {
-      const lk = await usernameLookup(targetId);
-      if (lk.ok) {
-        await safeSend(msg.chat.id, lk.text, { parse_mode: 'HTML', reply_markup: lk.link ? { inline_keyboard: [[{ text: '👤 فتح الملف الشخصي', url: lk.link }]] } : undefined });
-        return;
-      }
-      bot.sendMessage(msg.chat.id, '⚠️ لم أجد هذا اليوزر (أو الجلسة غير متاحة).').catch(() => {});
+    if (!(/^\d{5,12}$/.test(raw) || /^@?[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(raw))) {
+      bot.sendMessage(msg.chat.id, '⚠️ أرسل آيدي أو يوزر.').catch(() => {});
       return;
     }
-    const tgi = await tgAccountInfo('+' + targetId);
-    bot.sendMessage(msg.chat.id, `🔎 <b>بحث المدير</b>\n${tgi}`, { parse_mode: 'HTML' }).catch(() => {});
+    const lk = await resolveUserCard(raw);
+    if (lk.ok) {
+      await safeSend(msg.chat.id, lk.text, { parse_mode: 'HTML', reply_markup: lk.link ? { inline_keyboard: [[{ text: '👤 فتح الملف الشخصي', url: lk.link }]] } : undefined });
+    } else {
+      const why = lk.error === 'nosession' ? 'الجلسة غير متاحة.' : (lk.error === 'notfound' ? 'لم أجد هذا اليوزر.' : 'لا يمكن الوصول لهذا المستخدم (يجب أن يكون من جهات الاتصال أو في مجموعة مشتركة مع حساب البحث).');
+      bot.sendMessage(msg.chat.id, '⚠️ ' + why, { parse_mode: 'HTML' }).catch(() => {});
+    }
   });
 
   onText(/^\/listpremium$/, (msg) => {
@@ -1306,7 +1353,7 @@ function startBot() {
       const u = getUser(from);
       u.paid = (u.paid || 0) + amount;
       saveUsers();
-      const res = await usernameLookup(qq);
+      const res = await resolveUserCard(qq);
       if (res.ok) {
         await safeSend(from, res.text, { parse_mode: 'HTML', reply_markup: res.link ? { inline_keyboard: [[{ text: '👤 فتح الملف الشخصي', url: res.link }]] } : undefined });
         await notifyReveal(Object.assign({}, u, { id: from }), '@' + (res.username || qq), '⭐ نجوم', res.lines || []);
@@ -1369,4 +1416,4 @@ if (require.main === module) {
   startBot();
 }
 
-module.exports = { analyzeNumber, cleanNumber, regionFlag, lookupCarrier, buildOutput, getUser, isPremiumUser, premiumUsers, config };
+module.exports = { analyzeNumber, cleanNumber, regionFlag, lookupCarrier, buildOutput, getUser, isPremiumUser, premiumUsers, config, resolveUserCard };
