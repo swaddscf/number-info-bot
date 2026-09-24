@@ -295,6 +295,15 @@ function getTgClient() {
       await client.connect();
       const me = await client.getMe();
       console.log('✅ جلسة تيليجرام: ' + me.username);
+      try { await client.getDialogs({ limit: 100 }); } catch (e) {}
+      try {
+        const own = await client.getEntity(OWNER_ID);
+        if (own && own.username && !config.contact) {
+          config.contact = '@' + own.username;
+          saveConfig();
+          console.log('✅ حساب التواصل للمالك: @' + own.username);
+        }
+      } catch (e) {}
       tgClient = client;
       return client;
     } catch (e) {
@@ -351,12 +360,13 @@ const TERMS_TEXT = `📜 <b>شروط الاستخدام</b>
 تم تطوير هذا البوت بواسطة @${config.contact || 'المالك'}.`;
 
 function mainKeyboard() {
-  const rows = [[{ text: '📋 شروط الاستخدام', callback_data: 'info:terms' }]];
-  const row2 = [];
-  row2.push({ text: '👤 حسابي', callback_data: 'info:account' });
-  if (config.contact) row2.push({ text: '📞 تواصل مع المالك', callback_data: 'info:contact' });
-  rows.push(row2);
-  return { keyboard: rows, resize_keyboard: true };
+  return {
+    keyboard: [
+      [{ text: '📋 شروط الاستخدام', callback_data: 'info:terms' }],
+      [{ text: '👤 حسابي', callback_data: 'info:account' }, { text: '📞 تواصل مع المالك', callback_data: 'info:contact' }],
+    ],
+    resize_keyboard: true,
+  };
 }
 
 function adminMainKeyboard() {
@@ -850,7 +860,7 @@ async function onMessage(msg) {
         if (!res.ok) {
           u.used = Math.max(0, (u.used || 0) - 1);
           saveUsers();
-          const why = res.error === 'nosession' ? 'الجلسة غير متاحة، تواصل مع المالك.' : (res.error === 'notfound' ? 'لم أجد هذا المستخدم.' : 'لا يمكن الوصول لهذا المستخدم (يجب أن يكون من جهات الاتصال أو في مجموعة مشتركة مع حساب البحث).');
+          const why = res.error === 'nosession' ? 'الجلسة غير متاحة، تواصل مع المالك.' : (res.error === 'notfound' ? 'لم أجد هذا المستخدم.' : 'تعذّر الوصول لهذا الحساب (أُخفيت معلوماته في إعدادات الخصوصية، أو لا يسمح تيليجرام بعرضه لحساب البحث).');
           await safeSend(chatId, '⚠️ <b>' + why + '</b>', { parse_mode: 'HTML' });
           return;
         }
@@ -1080,7 +1090,9 @@ async function onCallback(qcb) {
     return;
   }
   if (data === 'info:contact') {
-    bot.sendMessage(chatId, `📞 <b>تواصل مع المالك</b>\n\n${config.contact || '—'}`, { parse_mode: 'HTML' }).catch(() => {});
+    bot.sendMessage(chatId, config.contact
+      ? `📞 <b>تواصل مع المالك</b>\n\nراسل: ${esc(String(config.contact).replace(/^@/, ''))}`
+      : `📞 <b>تواصل مع المالك</b>\n\nلم يُعيّن حساب تواصل بعد.\n(المالك: استخدم الأمر /setcontact @username)`, { parse_mode: 'HTML' }).catch(() => {});
     return;
   }
   if (data === 'noop') return;
@@ -1285,7 +1297,7 @@ function setupCommands(bot) {
     if (lk.ok) {
       await safeSend(msg.chat.id, lk.text, { parse_mode: 'HTML', reply_markup: lk.link ? { inline_keyboard: [[{ text: '👤 فتح الملف الشخصي', url: lk.link }]] } : undefined });
     } else {
-      const why = lk.error === 'nosession' ? 'الجلسة غير متاحة.' : (lk.error === 'notfound' ? 'لم أجد هذا اليوزر.' : 'لا يمكن الوصول لهذا المستخدم (يجب أن يكون من جهات الاتصال أو في مجموعة مشتركة مع حساب البحث).');
+      const why = lk.error === 'nosession' ? 'الجلسة غير متاحة.' : (lk.error === 'notfound' ? 'لم أجد هذا اليوزر.' : 'تعذّر الوصول لمعلومات هذا المستخدم (أُخفيت معلوماته في الخصوصية أو لا يوجد حساب بهذا الاسم).');
       bot.sendMessage(msg.chat.id, '⚠️ ' + why, { parse_mode: 'HTML' }).catch(() => {});
     }
   });
@@ -1309,7 +1321,7 @@ function setupCommands(bot) {
 let bot = null;
 
 function startBot() {
-  bot = new TelegramBot(BOT_TOKEN, { polling: true, onlyFirstMatch: true });
+  bot = new TelegramBot(BOT_TOKEN, { polling: { interval: 2000, params: { timeout: 20 } }, onlyFirstMatch: true });
   setupCommands(bot);
 
   bot.on('message', (msg) => {
@@ -1377,7 +1389,22 @@ function startBot() {
     }
   });
 
-  bot.on('polling_error', (err) => { console.error('⚠️ polling_error: ' + (err && err.message)); });
+  let pollHealPending = false;
+  bot.on('polling_error', (err) => {
+    const m = (err && err.message) || String(err);
+    console.error('⚠️ polling_error: ' + m);
+    if (/409|terminated by other/i.test(m) && !pollHealPending) {
+      pollHealPending = true;
+      console.log('🔁 تداخل في الاستطلاع — إعادة تشغيل الاستطلاع خلال 15 ثانية (تأكد من عدم تشغيل نسخة أخرى).');
+      setTimeout(() => {
+        try { bot.stopPolling({ cancel: true }); } catch (e) {}
+        setTimeout(() => {
+          try { bot.startPolling(); } catch (e) {}
+          pollHealPending = false;
+        }, 2000);
+      }, 15000);
+    }
+  });
 
   console.log('🤖 البوت يعمل الآن (polling).');
 
