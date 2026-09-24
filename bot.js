@@ -34,6 +34,7 @@ const DEFAULT_CONFIG = {
   regionEnabled: true,    // عرض المنطقة / المدينة
   dailyLimit: 0,          // 0 = غير محدود (لكل مستخدم في اليوم)
   perSearchStars: 0,      // 0 = ميزة الدفع معطلة
+  contact: '',            // نص زر "تواصل مع المالك" (فارغ = الزر مخفي)
 };
 
 let config = { ...DEFAULT_CONFIG, ...readJSON(CONFIG_FILE, {}) };
@@ -377,6 +378,24 @@ async function tgAccountInfo(e164) {
 }
 
 // ===================== لوحة المالك =====================
+const TERMS_TEXT =
+  '📜 <b>شروط استخدام البوت</b>\n' +
+  '━━━━━━━━━━━━━\n' +
+  '• يُستخدم البوت لأغراض مشروعة فقط ✅\n' +
+  '• ❌ ممنوع استخدامه للابتزاز أو التهديد أو التشهير\n' +
+  '• ❌ ممنوع تتبّع أو مضايقة أي شخص\n' +
+  '• 🗺️ الموقع المعروض تقريبي وليس دقيقًا\n' +
+  '• ⚠️ المعلومات تُعرض كما هي بدون ضمان دقتها\n' +
+  '• 🚫 لا يجوز بيع النتائج أو مشاركتها لضرر أحد\n' +
+  '━━━━━━━━━━━━━\n' +
+  '<i>باستخدامك البوت فأنت توافق تلقائيًا على هذه الشروط.</i>';
+
+function mainKeyboard() {
+  const kb = [['📋 شروط الاستخدام']];
+  if (config.contact) kb.push(['📞 تواصل مع المالك']);
+  return { keyboard: kb, resize_keyboard: true, one_time_keyboard: false };
+}
+
 function adminKeyboard() {
   const t = (v) => (v ? '🔓 مفتوح' : '🔒 مقفل');
   return {
@@ -386,6 +405,7 @@ function adminKeyboard() {
       [{ text: `🏙️ المنطقة / المدينة: ${t(config.regionEnabled)}`, callback_data: 'tog:region' }],
       [{ text: '🔒 قفل الكل', callback_data: 'lock:all' }, { text: '🔓 فتح الكل', callback_data: 'unlock:all' }],
       [{ text: `⭐ المميزون (بحث بلا حدود): ${premiumUsers().length}`, callback_data: 'list:premium' }],
+      [{ text: `📞 زر "تواصل مع المالك": ${config.contact ? 'مفعّل ✅' : 'معطّل' }`, callback_data: 'info:contact' }],
       [{ text: `📊 الحصة اليومية: ${config.dailyLimit === 0 ? 'غير محدود' : config.dailyLimit + ' بحث'}`, callback_data: 'info:limit' }],
       [{ text: `⭐ سعر البحث الكامل: ${config.perSearchStars === 0 ? 'معطل' : config.perSearchStars + ' ⭐'}`, callback_data: 'info:stars' }],
     ],
@@ -438,6 +458,22 @@ async function sendStarInvoice(chatId, number, stars) {
 async function onMessage(msg) {
   if (!msg.text) return;
   const text = msg.text.trim();
+
+  if (text === '📋 شروط الاستخدام') {
+    await bot.sendMessage(msg.chat.id, TERMS_TEXT, { parse_mode: 'HTML', reply_markup: mainKeyboard() });
+    return;
+  }
+  if (text === '📞 تواصل مع المالك') {
+    await bot.sendMessage(
+      msg.chat.id,
+      config.contact
+        ? '📞 <b>للتواصل مع المالك:</b>\n' + esc(config.contact)
+        : 'لم يُضِف المالك معلومات تواصل بعد.',
+      { parse_mode: 'HTML', reply_markup: mainKeyboard() }
+    );
+    return;
+  }
+
   if (text.startsWith('/')) return;
 
   const chatId = msg.chat.id;
@@ -551,6 +587,15 @@ async function onCallback(cb) {
     return;
   }
 
+  if (data === 'info:contact') {
+    await bot.answerCallbackQuery(cb.id, {
+      text: config.contact
+        ? 'مفعّل: ' + config.contact.slice(0, 40)
+        : 'معطّل — أرسل /setcontact <نص> لإضافته، أو /delcontact لحذفه',
+    });
+    return;
+  }
+
   if (data === 'tog:location') { config.locationEnabled = !config.locationEnabled; saveConfig(); }
   else if (data === 'tog:username') { config.usernameEnabled = !config.usernameEnabled; saveConfig(); }
   else if (data === 'tog:region') { config.regionEnabled = !config.regionEnabled; saveConfig(); }
@@ -594,7 +639,7 @@ async function onStart(msg) {
     '• 🗺️ موقعه التقريبي على الخريطة\n' +
     '• 🤖 إذا كان الرقم مسجلاً في تيليجرام سأعرض يوزر الحساب\n\n' +
     '⚠️ <i>الموقع تقريبي ويعتمد على الدولة/المنطقة فقط، وليس موقع الشخص الفعلي.</i>';
-  await bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
+  await bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML', reply_markup: mainKeyboard() });
 }
 
 async function onAdmin(msg) {
@@ -606,6 +651,7 @@ async function onAdmin(msg) {
     '• <code>/setlimit &lt;معرّف المستخدم&gt; 5</code> — حصة لمستخدم معين\n' +
     '• <code>/premium &lt;معرّف المستخدم&gt;</code> — رفع/إزالة مميز (بحث بلا حدود)\n' +
     '• <code>/lookup @يوزر</code> أو <code>/lookup &lt;آيدي&gt;</code> — جلب معلومات مستخدم\n' +
+    '• <code>/setcontact نص</code> / <code>/delcontact</code> — إظهار/حذف زر التواصل السفلي\n' +
     '• <code>/setprice 2</code> — سعر البحث الكامل بالنجوم (0 = تعطيل الدفع)\n' +
     '• <code>/stats</code> — إحصائيات',
     { parse_mode: 'HTML', reply_markup: adminKeyboard() }
@@ -731,6 +777,27 @@ async function onLookup(msg, arg) {
   await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
 }
 
+async function onSetContact(msg, arg) {
+  const chatId = msg.chat.id;
+  if (!arg || !arg.trim()) {
+    await bot.sendMessage(chatId,
+      'الاستخدام:\n<code>/setcontact اسمك - @يوزرك - قناتك</code> — يُظهر زر "📞 تواصل مع المالك"\n<code>/delcontact</code> — حذف الزر نهائيًا',
+      { parse_mode: 'HTML' });
+    return;
+  }
+  config.contact = arg.trim();
+  saveConfig();
+  await bot.sendMessage(chatId,
+    '✅ تم حفظ معلومات التواصل.\nسيظهر زر <b>"📞 تواصل مع المالك"</b> أسفل حقل الكتابة.',
+    { parse_mode: 'HTML', reply_markup: mainKeyboard() });
+}
+
+async function onDelContact(msg) {
+  config.contact = '';
+  saveConfig();
+  await bot.sendMessage(msg.chat.id, '✅ تم حذف زر التواصل نهائيًا.', { parse_mode: 'HTML' });
+}
+
 async function onStats(msg) {
   const today = todayKey();
   let todaySearches = 0;
@@ -801,6 +868,20 @@ if (require.main === module) {
       return;
     }
     await onLookup(msg, match[2]);
+  });
+  bot.onText(/^\/setcontact(@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
+    if (!isOwner(msg.from.id)) {
+      await bot.sendMessage(msg.chat.id, '⛔ هذا الأمر للإدارة فقط.');
+      return;
+    }
+    await onSetContact(msg, match[2]);
+  });
+  bot.onText(/^\/delcontact(@\w+)?$/, async (msg) => {
+    if (!isOwner(msg.from.id)) {
+      await bot.sendMessage(msg.chat.id, '⛔ هذا الأمر للإدارة فقط.');
+      return;
+    }
+    await onDelContact(msg);
   });
   bot.onText(/^\/stats(@\w+)?$/, async (msg) => {
     if (!isOwner(msg.from.id)) {
