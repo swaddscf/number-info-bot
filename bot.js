@@ -354,19 +354,17 @@ const TERMS_TEXT = `📜 <b>شروط الاستخدام</b>
 • المعلومات معروضة لأغراض المعرفة فقط، والبيانات قد تكون غير دقيقة أو قديمة.
 • المحتوى محمي بحقوق المالك والبوت. أي إساءة = حظر دائم.
 • يمكن حماية رقمك من البحث مقابل ⭐ نجوم (حسب إعدادات المالك).
-• للاستفسار أو البلاغ تواصل مع المالك عبر زر «📞 تواصل مع المالك» بالأسفل.
+• للاستفسار أو البلاغ تواصل مع المالك.
 • <b>النطاق الدقيق للموقع تقريبي</b> ولا يمثل عنوانًا دقيقًا للمنزل.
 
 تم تطوير هذا البوت بواسطة @${config.contact || 'المالك'}.`;
 
-function mainKeyboard() {
-  return {
-    keyboard: [
-      [{ text: '📋 شروط الاستخدام', callback_data: 'info:terms' }],
-      [{ text: '👤 حسابي', callback_data: 'info:account' }, { text: '📞 تواصل مع المالك', callback_data: 'info:contact' }],
-    ],
-    resize_keyboard: true,
-  };
+function mainKeyboard(userId) {
+  const rows = [[{ text: '👤 حسابي', callback_data: 'noop' }]];
+  if (userId !== undefined && isOwner(userId)) {
+    rows.push([{ text: '🛠 لوحة تحكم المالك', callback_data: 'noop' }]);
+  }
+  return { keyboard: rows, resize_keyboard: true };
 }
 
 function adminMainKeyboard() {
@@ -456,7 +454,7 @@ function settingsKeyboard() {
       [{ text: `⏱️ تجدد الحصة كل: ${config.quotaHours} ساعة (تعديل /setquotahours)`, callback_data: 'noop' }],
       [{ text: `⭐ سعر البحث المميز: ${config.perSearchStars} (تعديل /setprice)`, callback_data: 'noop' }],
       [{ text: `💎 الشحن: ${config.topupStars}⭐ = ${config.topupAmount} بحث (تعديل /settopup)`, callback_data: 'noop' }],
-      [{ text: `📞 زر تواصل: ${config.contact ? 'مفعل' : 'معطل'} (/setcontact)`, callback_data: 'noop' }],
+      [{ text: `📞 جهة المالك: ${config.contact ? esc(config.contact) + ' (/delcontact)' : 'غير معيّنة (/setcontact)'}`, callback_data: 'noop' }],
       BACK_HOME,
     ],
   };
@@ -743,8 +741,8 @@ function onStart(msg) {
 ━
 ⚙️ من طرف المالك:
 • <b>${config.dailyLimit}</b> بحث مجاني لكل ${config.quotaHours} ساعة
-${config.perSearchStars > 0 ? '• يمكن دفع ⭐ للحصول على معلومات كاملة ومحدثة\n' : ''}${config.protectPrice > 0 ? '• يمكنك حماية رقمك من البحث مقابل ' + config.protectPrice + ' ⭐ (/protect)\n' : ''}• تابع «📋 شروط الاستخدام» و«👤 حسابي» في الأسفل`;
-  bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: mainKeyboard() }).catch(() => {});
+${config.perSearchStars > 0 ? '• يمكن دفع ⭐ للحصول على معلومات كاملة ومحدثة\n' : ''}${config.protectPrice > 0 ? '• يمكنك حماية رقمك من البحث مقابل ' + config.protectPrice + ' ⭐ (/protect)\n' : ''}• تابع زر «👤 حسابي» في الأسفل`;
+  bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: mainKeyboard(msg.from.id) }).catch(() => {});
 }
 
 function onHelp(msg) {
@@ -770,6 +768,16 @@ async function onMessage(msg) {
     const now = Date.now();
     if (now - (lastMsg[userId] || 0) < 1200) return;
     lastMsg[userId] = now;
+  }
+
+  const qq = String(msg.text).trim();
+  if (qq === '👤 حسابي') {
+    await safeSend(chatId, accountCard(userId), { parse_mode: 'HTML' });
+    return;
+  }
+  if (isOwner(userId) && qq === '🛠 لوحة تحكم المالك') {
+    bot.sendMessage(chatId, adminPaneText('main'), { parse_mode: 'HTML', reply_markup: adminMainKeyboard() }).catch(() => {});
+    return;
   }
 
   if (isOwner(userId)) {
