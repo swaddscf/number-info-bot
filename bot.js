@@ -14,6 +14,7 @@ const OWNER_ID = String(process.env.OWNER_ID || '').trim();
 const API_ID = parseInt(process.env.TELEGRAM_API_ID || '0', 10);
 const API_HASH = String(process.env.TELEGRAM_API_HASH || '');
 const TG_SESSION = String(process.env.TG_SESSION || '');
+const WEBHOOK_URL = String(process.env.WEBHOOK_URL || '').trim();
 const DATA_DIR = String(process.env.DATA_DIR || path.join(__dirname, 'data'));
 
 const PHONE = phonenumbers.PhoneNumberUtil.getInstance();
@@ -1328,8 +1329,14 @@ function setupCommands(bot) {
 
 let bot = null;
 
-function startBot() {
-  bot = new TelegramBot(BOT_TOKEN, { polling: { interval: 2000, params: { timeout: 20 } }, onlyFirstMatch: true });
+async function startBot() {
+  if (WEBHOOK_URL) {
+    bot = new TelegramBot(BOT_TOKEN, { polling: false, onlyFirstMatch: true });
+    console.log('🌐 وضع الاستقبال: Webhook → ' + WEBHOOK_URL);
+  } else {
+    bot = new TelegramBot(BOT_TOKEN, { polling: { interval: 2000, params: { timeout: 20 } }, onlyFirstMatch: true });
+    console.log('🌐 وضع الاستقبال: Polling');
+  }
   setupCommands(bot);
 
   bot.on('message', (msg) => {
@@ -1397,24 +1404,32 @@ function startBot() {
     }
   });
 
-  let pollHealPending = false;
-  bot.on('polling_error', (err) => {
-    const m = (err && err.message) || String(err);
-    console.error('⚠️ polling_error: ' + m);
-    if (/409|terminated by other/i.test(m) && !pollHealPending) {
-      pollHealPending = true;
-      console.log('🔁 تداخل في الاستطلاع — إعادة تشغيل الاستطلاع خلال 15 ثانية (تأكد من عدم تشغيل نسخة أخرى).');
-      setTimeout(() => {
-        try { bot.stopPolling({ cancel: true }); } catch (e) {}
+  if (!WEBHOOK_URL) {
+    let pollHealPending = false;
+    bot.on('polling_error', (err) => {
+      const m = (err && err.message) || String(err);
+      console.error('⚠️ polling_error: ' + m);
+      if (/409|terminated by other/i.test(m) && !pollHealPending) {
+        pollHealPending = true;
+        console.log('🔁 تداخل في الاستطلاع — إعادة تشغيل الاستطلاع خلال 15 ثانية (تأكد من عدم تشغيل نسخة أخرى).');
         setTimeout(() => {
-          try { bot.startPolling(); } catch (e) {}
-          pollHealPending = false;
-        }, 2000);
-      }, 15000);
+          try { bot.stopPolling({ cancel: true }); } catch (e) {}
+          setTimeout(() => {
+            try { bot.startPolling(); } catch (e) {}
+            pollHealPending = false;
+          }, 2000);
+        }, 15000);
+      }
+    });
+    console.log('🤖 البوت يعمل الآن (polling).');
+  } else {
+    try {
+      await bot.setWebHook(WEBHOOK_URL, { max_connections: 40 });
+      console.log('✅ تم تسجيل الويبهوك بنجاح: ' + WEBHOOK_URL);
+    } catch (e) {
+      console.error('❌ فشل تسجيل الويبهوك: ' + e.message);
     }
-  });
-
-  console.log('🤖 البوت يعمل الآن (polling).');
+  }
 
   setInterval(() => {
     try { bot.getMe().catch(() => {}); } catch (e) {}
@@ -1429,8 +1444,13 @@ function stopBot() {
 
 if (require.main === module) {
   http.createServer((req, res) => {
+    const u = (req.url || '/').split('?')[0];
+    if (WEBHOOK_URL && bot && u === '/webhook') {
+      bot.webhookCallback('/webhook')(req, res);
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, uptime: Math.floor(process.uptime()), users: Object.keys(users).length }));
+    res.end(JSON.stringify({ ok: true, uptime: Math.floor(process.uptime()), users: Object.keys(users).length, mode: WEBHOOK_URL ? 'webhook' : 'polling' }));
   }).listen(PORT, () => {
     console.log(`✅ HTTP server على المنفذ ${PORT}`);
   });
@@ -1448,7 +1468,7 @@ process.on('SIGTERM', () => { console.log('▪️ إيقاف SIGTERM'); stopBot(
 process.on('SIGINT', () => { console.log('▪️ إيقاف SIGINT'); stopBot(); process.exit(0); });
 
 if (require.main === module) {
-  startBot();
+  startBot().catch((e) => console.error('❌ فشل تشغيل البوت: ' + e.message));
 }
 
 module.exports = { analyzeNumber, cleanNumber, regionFlag, lookupCarrier, buildOutput, getUser, isPremiumUser, premiumUsers, config, resolveUserCard };
